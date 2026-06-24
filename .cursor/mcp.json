@@ -12,6 +12,16 @@
         "configs/config.toml"
       ],
       "description": "MCP stdio: статистика, конфиг, reload и смена MTProto secret"
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "description": "Доступ к файлам проекта StealthGate"
+    },
+    "fetch": {
+      "command": "npx",
+      "args": ["-y", "fetch-mcp"],
+      "description": "HTTP-клиент для тестирования WebUI и MCP API"
     }
   }
 }
