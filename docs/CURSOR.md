@@ -4,7 +4,15 @@
 
 ## MCP-сервер
 
-Файл [`.cursor/mcp.json`](../.cursor/mcp.json) подключает `stealth-gate-mcp` через **stdio**:
+Файл [`.cursor/mcp.json`](../.cursor/mcp.json) подключает:
+
+| Сервер | Назначение |
+|--------|------------|
+| `stealth-gate` | MCP stdio — статистика, конфиг, reload, смена secret |
+| `filesystem` | Чтение файлов проекта |
+| `fetch` | HTTP-запросы к WebUI/MCP API |
+
+Основной сервер — `stealth-gate-mcp` через **stdio**:
 
 ```json
 {
