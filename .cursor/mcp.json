@@ -1,0 +1,46 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "env": {},
+      "disabled": false,
+      "description": "Безопасный доступ к файлам проекта. Используется для чтения шаблонов, Python-модулей и генерации кода в рамках .cursor/mcp.json"
+    },
+    "sqlite": {
+      "command": "npx",
+      "args": ["-y", "mcp-server-sqlite", "--db", "C:\\Users\\Ivan\\Documents\\PVS-Studio-Tracker\\pvs_tracker.db"],
+      "env": {},
+      "disabled": false,
+      "description": "Прямой доступ к SQLite БД через официальный MCP-сервер"
+    },
+    "fetch": {
+      "command": "npx",
+      "args": ["-y", "fetch-mcp"],
+      "env": {},
+      "disabled": false,
+      "description": "HTTP-клиент для тестирования API. Используется для проверки POST /api/v1/upload, GET /ui/* и webhook-эндпоинтов локально"
+    },
+    "terminal-mcp": {
+      "command": "python",
+      "args": ["-m", "TMCP.mcp_terminal.server"]
+    },
+    "postgresql": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-postgresql"
+      ],
+      "env": {
+        "DATABASE_URL": "postgresql://user:password@localhost:5432/dbname"
+      }
+    },
+    "sery": {
+      "command": "sery-mcp",
+      "args": ["--root", "/Users/ваше-имя/Documents"]
+    },
+    "tool42": {
+      "command": "tool42"
+    }
+  }
+}
