@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>StealthGate — Дашборд</title>
+  <link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand compact">
+        <div class="brand-mark">SG</div>
+        <strong>StealthGate</strong>
+      </div>
+      <nav class="nav">
+        <a class="nav-link active" href="/ui/dashboard.html">Дашборд</a>
+        <a class="nav-link" href="/ui/users.html" data-role="admin">Пользователи</a>
+      </nav>
+      <div class="sidebar-footer">
+        <div id="current-user" class="muted"></div>
+        <button id="logout-btn" class="btn ghost">Выйти</button>
+      </div>
+    </aside>
+
+    <main class="content">
+      <header class="page-header">
+        <div>
+          <h1>Дашборд</h1>
+          <p class="muted">Статистика и настройки MTProto-прокси</p>
+        </div>
+        <button id="reload-btn" class="btn">Перезагрузить конфиг</button>
+      </header>
+
+      <section class="grid stats-grid" id="stats-grid"></section>
+
+      <section class="panel">
+        <h2>MTProto</h2>
+        <form id="mtproto-form" class="form-grid">
+          <label>
+            Секрет
+            <input type="text" name="secret" required>
+          </label>
+          <label>
+            Backend
+            <input type="text" name="backend" required>
+          </label>
+          <label>
+            Fake domain
+            <input type="text" name="fake_domain" required>
+          </label>
+          <div class="form-actions">
+            <button type="submit" class="btn primary">Сохранить MTProto</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel">
+        <h2>Фрагментация</h2>
+        <form id="fragmentation-form" class="form-grid">
+          <label class="checkbox">
+            <input type="checkbox" name="enabled">
+            Включить фрагментацию
+          </label>
+          <label>
+            Chunk sizes (через запятую)
+            <input type="text" name="chunk_sizes" placeholder="1,2,3,2,1">
+          </label>
+          <label>
+            Delay, ms
+            <input type="number" name="delay_ms" min="0" value="0">
+          </label>
+          <div class="form-actions">
+            <button type="submit" class="btn primary">Сохранить фрагментацию</button>
+          </div>
+        </form>
+      </section>
+
+      <p id="dashboard-message" class="message hidden"></p>
+    </main>
+  </div>
+  <script src="/ui/app.js"></script>
+  <script>
+    initDashboardPage();
+  </script>
+</body>
+</html>

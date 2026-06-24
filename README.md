@@ -10,9 +10,11 @@
 ## 🎯 Возможности
 
 - **Асинхронный I/O**: на базе `tokio`, выдерживает тысячи одновременных соединений.
-- **Настоящая эмуляция TLS**: использует `rustls` с кастомизацией ClientHello (JA4-эмуляция).
+- **TLS-терминация**: `rustls` для fallback-трафика, JA4-фингерпринт ClientHello.
 - **Динамическая фрагментация**: разбивает начальный пакет на фрагменты для обхода DPI.
-- **Интеграция с nginx**: заглушка для не-MTProto трафика.
+- **WebUI-дашборд**: управление пользователями, секретом MTProto, backend и фрагментацией.
+- **Admin API**: Unix-сокет и REST для статистики, reload конфига, смены секрета.
+- **MCP**: stdio и streamable HTTP transport для управления из Cursor/Claude.
 - **Простая конфигурация** через TOML.
 
 ## 🏗️ Архитектура
@@ -45,22 +47,28 @@ flowchart LR
 ```bash
 git clone https://github.com/your-username/StealthGate.git
 cd StealthGate
+./scripts/gen-cert.sh          # self-signed сертификат для TLS
 cargo build --release
-./target/release/StealthGate --config configs/config.toml
+./target/release/stealth-gate --config configs/config.toml
 ```
 
-### Через `cargo install`
+WebUI: [http://127.0.0.1:8088/ui/login.html](http://127.0.0.1:8088/ui/login.html) (логин по умолчанию `admin` / `admin123`).
+
+### MCP-сервер
 
 ```bash
-cargo install StealthGate
-StealthGate --config ~/.config/StealthGate/config.toml
+# stdio (для Cursor)
+./target/release/stealth-gate-mcp --config configs/config.toml
+
+# streamable HTTP
+./target/release/stealth-gate-mcp --transport http --http-port 8090
 ```
 
 ### Docker
 
 ```bash
-docker build -t StealthGate .
-docker run -p 443:443 -v $(pwd)/configs:/app/configs StealthGate
+docker build -t stealth-gate .
+docker run -p 443:443 -p 8088:8088 -v $(pwd)/configs:/app/configs stealth-gate
 ```
 
 ## ⚙️ Конфигурация
@@ -82,8 +90,43 @@ secret = "ee0123456789abcdef..."
 backend = "149.154.167.99:443"
 
 [fallback]
-upstream = "http://localhost:8080"
+static_html = "web/index.html"
+
+[fragmentation]
+enabled = true
+chunk_sizes = [1, 2, 3, 2, 1]
+delay_ms = 0
+
+[admin]
+socket = "/tmp/stealth-gate.sock"
+
+[webui]
+enabled = true
+host = "127.0.0.1"
+port = 8088
+session_secret = "change-me-in-production"
+users_file = "data/users.json"
 ```
+
+## 🖥️ WebUI
+
+При `webui.enabled = true` поднимается HTTP-сервер с сессиями (signed cookies) и ролями:
+
+| Роль | Права |
+|------|-------|
+| `admin` | пользователи, настройки прокси, reload конфига |
+| `operator` | настройки прокси, статистика |
+| `viewer` | только просмотр статистики |
+
+REST API (`/api/v1/*`):
+
+- `POST /auth/login`, `POST /auth/logout`, `GET /auth/me`
+- `GET /stats`, `GET /config`, `POST /config/reload`
+- `PUT /config/mtproto` — secret, backend, fake_domain
+- `PUT /config/fragmentation` — enabled, chunk_sizes, delay_ms
+- `GET/POST /users`, `DELETE /users/{username}`, `PUT /users/{username}/password`
+
+Статика дашборда: `web/dashboard/` (`login.html`, `dashboard.html`, `users.html`).
 
 ## 🔌 Подключение в Telegram
 
@@ -102,20 +145,34 @@ cargo test -- --ignored  # интеграционные тесты
 
 ## 🧩 MCP-интеграция
 
-В проекте реализован MCP-сервер на Rust (например, на базе `turbomcp`). Для подключения к Cursor добавьте в `~/.cursor/mcp.json`:
+Бинарник `stealth-gate-mcp` предоставляет инструменты: `get_stats`, `get_config`, `reload_config`, `update_secret`.
+
+**stdio** (Cursor):
 
 ```json
 {
   "mcpServers": {
-    "StealthGate": {
-      "command": "StealthGate-mcp",
+    "stealth-gate": {
+      "command": "/path/to/stealth-gate-mcp",
       "args": ["--config", "/path/to/config.toml"]
     }
   }
 }
 ```
 
-Теперь вы можете управлять прокси (просмотр статистики, смена секретов, перезагрузка) через AI-ассистента.
+**streamable HTTP** (`POST /mcp` на порту 8090):
+
+```json
+{
+  "mcpServers": {
+    "stealth-gate": {
+      "url": "http://127.0.0.1:8090/mcp"
+    }
+  }
+}
+```
+
+MCP работает напрямую с `AppState` прокси (без Unix-сокета), если оба процесса используют один конфиг.
 
 ## 📄 Лицензия
 

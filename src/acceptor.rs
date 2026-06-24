@@ -140,6 +140,8 @@ pub async fn run_acceptor(state: Arc<AppState>) -> Result<()> {
     });
   }
 
+  crate::web::spawn_webui(Arc::clone(&state));
+
   let listener = tokio::net::TcpListener::bind(listen_addr)
     .await
     .map_err(|err| StealthGateError::Proxy(format!("bind {listen_addr}: {err}")))?;
@@ -178,6 +180,6 @@ where
 
 /// Запускает прокси с конфигурацией (удобно для тестов).
 pub async fn run_with_config(config: Config, config_path: &str) -> Result<()> {
-  let state = AppState::new(config, config_path);
+  let state = AppState::new(config, config_path)?;
   run_acceptor(state).await
 }

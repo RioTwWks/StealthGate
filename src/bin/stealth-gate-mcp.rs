@@ -1,142 +1,106 @@
-use std::borrow::Cow;
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use rmcp::{
-  handler::server::{tool::ToolRouter, wrapper::Parameters},
-  model::{CallToolResult, Content, ErrorCode, ErrorData, Implementation, ServerCapabilities, ServerInfo},
-  schemars, tool, tool_router, ServerHandler, ServiceExt,
+  transport::streamable_http_server::{
+    session::local::LocalSessionManager, tower::StreamableHttpService, StreamableHttpServerConfig,
+  },
+  ServiceExt,
 };
-use serde::Deserialize;
+use tokio_util::sync::CancellationToken;
+use tracing_subscriber::EnvFilter;
 
-/// MCP-сервер управления StealthGate.
-#[derive(Clone)]
-pub struct StealthGateMcp {
-  admin_socket: String,
-  #[allow(dead_code)]
-  tool_router: ToolRouter<Self>,
-}
+use stealth_gate::{AppState, Config, StealthGateMcp};
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct UpdateSecretRequest {
-  /// Новый hex-секрет MTProto (32 символа, опционально с префиксом ee/dd).
-  secret: String,
-}
-
-impl StealthGateMcp {
-  fn new(admin_socket: impl Into<String>) -> Self {
-    Self {
-      admin_socket: admin_socket.into(),
-      tool_router: Self::tool_router(),
-    }
-  }
-}
-
-#[tool_router]
-impl StealthGateMcp {
-  #[tool(description = "Получить статистику работающего прокси StealthGate")]
-  async fn get_stats(&self) -> Result<CallToolResult, ErrorData> {
-    let body = stealth_gate::admin::admin_request(&self.admin_socket, "GET", "/stats", None)
-      .await
-      .map_err(admin_error)?;
-    Ok(CallToolResult::success(vec![Content::text(body)]))
-  }
-
-  #[tool(description = "Получить краткую сводку конфигурации прокси")]
-  async fn get_config(&self) -> Result<CallToolResult, ErrorData> {
-    let body = stealth_gate::admin::admin_request(&self.admin_socket, "GET", "/config", None)
-      .await
-      .map_err(admin_error)?;
-    Ok(CallToolResult::success(vec![Content::text(body)]))
-  }
-
-  #[tool(description = "Перезагрузить конфигурацию прокси с диска")]
-  async fn reload_config(&self) -> Result<CallToolResult, ErrorData> {
-    let body =
-      stealth_gate::admin::admin_request(&self.admin_socket, "POST", "/reload", None)
-        .await
-        .map_err(admin_error)?;
-    Ok(CallToolResult::success(vec![Content::text(body)]))
-  }
-
-  #[tool(description = "Обновить MTProto-секрет без перезапуска прокси")]
-  async fn update_secret(
-    &self,
-    Parameters(request): Parameters<UpdateSecretRequest>,
-  ) -> Result<CallToolResult, ErrorData> {
-    let payload = serde_json::json!({ "secret": request.secret }).to_string();
-    let body = stealth_gate::admin::admin_request(
-      &self.admin_socket,
-      "POST",
-      "/secret",
-      Some(&payload),
-    )
-    .await
-    .map_err(admin_error)?;
-    Ok(CallToolResult::success(vec![Content::text(body)]))
-  }
-}
-
-impl ServerHandler for StealthGateMcp {
-  fn get_info(&self) -> ServerInfo {
-    ServerInfo {
-      instructions: Some(
-        "Управление StealthGate: статистика, перезагрузка конфигурации, смена секрета".into(),
-      ),
-      capabilities: ServerCapabilities::builder().enable_tools().build(),
-      server_info: Implementation {
-        name: "stealth-gate-mcp".into(),
-        version: env!("CARGO_PKG_VERSION").into(),
-        ..Default::default()
-      },
-      ..Default::default()
-    }
-  }
-}
-
-fn admin_error(err: stealth_gate::StealthGateError) -> ErrorData {
-  ErrorData {
-    code: ErrorCode(-32603),
-    message: Cow::from(format!("admin API: {err}")),
-    data: None,
-  }
+#[derive(Debug, Clone, ValueEnum)]
+enum Transport {
+  Stdio,
+  Http,
 }
 
 /// MCP-сервер StealthGate.
 #[derive(Debug, Parser)]
 #[command(name = "stealth-gate-mcp", about = "MCP-интерфейс управления StealthGate")]
 struct Args {
-  /// Путь к Unix-сокету admin API прокси.
-  #[arg(long, env = "STEALTHGATE_ADMIN_SOCKET")]
-  admin_socket: Option<PathBuf>,
+  /// Транспорт MCP: stdio или streamable HTTP.
+  #[arg(long, value_enum, default_value_t = Transport::Stdio)]
+  transport: Transport,
 
-  /// Путь к TOML-конфигурации (для определения admin socket).
+  /// HTTP-хост для streamable MCP.
+  #[arg(long, default_value = "127.0.0.1")]
+  http_host: String,
+
+  /// HTTP-порт для streamable MCP.
+  #[arg(long, default_value_t = 8090)]
+  http_port: u16,
+
+  /// Путь к TOML-конфигурации прокси.
   #[arg(short, long, default_value = "configs/config.toml")]
   config: PathBuf,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+  tracing_subscriber::fmt()
+    .with_env_filter(
+      EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+    )
+    .init();
+
   let args = Args::parse();
+  let config = Config::from_file(&args.config).context("загрузка config.toml")?;
+  let config_path = args.config.to_string_lossy().to_string();
+  let state = AppState::new(config, config_path).context("инициализация состояния")?;
 
-  let admin_socket = if let Some(socket) = args.admin_socket {
-    socket
-  } else if let Ok(config) = stealth_gate::Config::from_file(&args.config) {
-    config
-      .admin
-      .socket
-      .map(PathBuf::from)
-      .unwrap_or_else(|| PathBuf::from("/tmp/stealth-gate.sock"))
-  } else {
-    PathBuf::from("/tmp/stealth-gate.sock")
-  };
+  match args.transport {
+    Transport::Stdio => run_stdio(state).await?,
+    Transport::Http => run_http(state, &args.http_host, args.http_port).await?,
+  }
 
-  let service = StealthGateMcp::new(admin_socket.to_string_lossy());
+  Ok(())
+}
+
+async fn run_stdio(state: Arc<AppState>) -> anyhow::Result<()> {
+  let service = StealthGateMcp::new(state);
   let running = service
     .serve(rmcp::transport::stdio())
     .await
     .context("запуск MCP stdio transport")?;
   running.waiting().await.context("MCP server stopped")?;
+  Ok(())
+}
+
+async fn run_http(state: Arc<AppState>, host: &str, port: u16) -> anyhow::Result<()> {
+  let addr: SocketAddr = format!("{host}:{port}")
+    .parse()
+    .context("некорректный HTTP-адрес MCP")?;
+  let ct = CancellationToken::new();
+  let service = StreamableHttpService::new(
+    move || Ok(StealthGateMcp::new(Arc::clone(&state))),
+    Arc::new(LocalSessionManager::default()),
+    StreamableHttpServerConfig {
+      stateful_mode: true,
+      sse_keep_alive: None,
+      cancellation_token: ct.child_token(),
+      ..Default::default()
+    },
+  );
+
+  let router = axum::Router::new().nest_service("/mcp", service);
+  let listener = tokio::net::TcpListener::bind(addr)
+    .await
+    .context("bind MCP HTTP listener")?;
+
+  tracing::info!(%addr, "MCP streamable HTTP доступен на /mcp");
+
+  let server = axum::serve(listener, router).with_graceful_shutdown(async move {
+    tokio::signal::ctrl_c().await.ok();
+    ct.cancel();
+  });
+
+  server.await.context("MCP HTTP server stopped")?;
   Ok(())
 }

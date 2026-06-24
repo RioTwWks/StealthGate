@@ -33,6 +33,10 @@ fn test_config() -> Arc<Config> {
     },
     fragmentation: stealth_gate::config::FragmentationConfig::default(),
     admin: stealth_gate::config::AdminConfig::default(),
+    webui: stealth_gate::config::WebuiConfig {
+      users_file: "data/users.json".into(),
+      ..Default::default()
+    },
   })
 }
 

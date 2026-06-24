@@ -1,0 +1,244 @@
+:root {
+  --bg: #0b1020;
+  --panel: #121a2f;
+  --panel-2: #18233d;
+  --text: #e8eefc;
+  --muted: #93a1c6;
+  --accent: #4f8cff;
+  --accent-2: #22c55e;
+  --danger: #ef4444;
+  --border: rgba(255, 255, 255, 0.08);
+  --shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: Inter, system-ui, sans-serif;
+  background: linear-gradient(180deg, #0a0f1d 0%, #111827 100%);
+  color: var(--text);
+}
+
+a { color: inherit; text-decoration: none; }
+
+.auth-page {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.auth-card, .panel {
+  background: rgba(18, 26, 47, 0.92);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  box-shadow: var(--shadow);
+}
+
+.auth-card {
+  width: min(100%, 420px);
+  padding: 28px;
+}
+
+.brand {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  margin-bottom: 24px;
+}
+
+.brand.compact { margin-bottom: 18px; }
+
+.brand-mark {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  font-weight: 700;
+  background: linear-gradient(135deg, #4f8cff, #7c3aed);
+}
+
+.brand h1, .page-header h1 {
+  margin: 0;
+  font-size: 1.4rem;
+}
+
+.muted { color: var(--muted); }
+
+.layout {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 260px 1fr;
+}
+
+.sidebar {
+  padding: 24px 18px;
+  border-right: 1px solid var(--border);
+  background: rgba(8, 12, 24, 0.85);
+  display: flex;
+  flex-direction: column;
+}
+
+.nav {
+  display: grid;
+  gap: 8px;
+  margin-top: 24px;
+}
+
+.nav-link {
+  padding: 10px 12px;
+  border-radius: 10px;
+  color: var(--muted);
+}
+
+.nav-link.active, .nav-link:hover {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.sidebar-footer {
+  margin-top: auto;
+  display: grid;
+  gap: 10px;
+}
+
+.content {
+  padding: 28px;
+}
+
+.page-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: center;
+  margin-bottom: 24px;
+}
+
+.grid {
+  display: grid;
+  gap: 16px;
+}
+
+.stats-grid {
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  margin-bottom: 24px;
+}
+
+.stat-card {
+  padding: 18px;
+  border-radius: 16px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+}
+
+.stat-card strong {
+  display: block;
+  font-size: 1.6rem;
+  margin-top: 8px;
+}
+
+.panel {
+  padding: 20px;
+  margin-bottom: 20px;
+}
+
+.stack, .form-grid {
+  display: grid;
+  gap: 14px;
+}
+
+.form-grid {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+label {
+  display: grid;
+  gap: 8px;
+  font-size: 0.92rem;
+  color: var(--muted);
+}
+
+input, select, button {
+  font: inherit;
+}
+
+input, select {
+  width: 100%;
+  padding: 11px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: #0d1426;
+  color: var(--text);
+}
+
+.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.btn {
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  padding: 10px 14px;
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.btn.primary {
+  background: linear-gradient(135deg, #4f8cff, #3b6fd8);
+  border-color: transparent;
+}
+
+.btn.ghost {
+  background: transparent;
+}
+
+.btn.danger {
+  background: rgba(239, 68, 68, 0.12);
+  color: #fecaca;
+  border-color: rgba(239, 68, 68, 0.3);
+}
+
+.form-actions {
+  display: flex;
+  align-items: end;
+}
+
+.table-wrap { overflow-x: auto; }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th, td {
+  text-align: left;
+  padding: 12px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.message, .error {
+  margin-top: 16px;
+  padding: 12px 14px;
+  border-radius: 10px;
+}
+
+.message {
+  background: rgba(34, 197, 94, 0.12);
+  color: #bbf7d0;
+}
+
+.error {
+  background: rgba(239, 68, 68, 0.12);
+  color: #fecaca;
+}
+
+.hidden { display: none; }
+
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; }
+  .sidebar { border-right: 0; border-bottom: 1px solid var(--border); }
+}
