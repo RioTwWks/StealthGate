@@ -142,10 +142,23 @@ tg://proxy?server=YOUR_IP&port=443&secret=ee0123456789...
 
 ```bash
 cargo test                    # все тесты
-cargo test --test webui       # WebUI: login + API
+cargo test --test webui       # WebUI: login, API, QR
+cargo test --test webhooks    # webhook-уведомления
 cargo test --test tls_handshake
 cargo test --test mcp_http
 cargo test -- --ignored       # сетевые интеграционные
+```
+
+### Webhook receiver (пример)
+
+```bash
+# Терминал 1 — приёмник
+cargo run --example webhook-receiver -- --port 9999
+
+# config.toml
+[webhooks]
+enabled = true
+urls = ["http://127.0.0.1:9999/hook"]
 ```
 
 ## 🧩 MCP-интеграция
