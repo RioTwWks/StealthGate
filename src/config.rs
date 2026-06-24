@@ -54,6 +54,26 @@ impl TlsConfig {
   }
 }
 
+/// Режим MTProto-секрета.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SecretMode {
+  Classic,
+  /// Secure dd — рандомизированные размеры пакетов.
+  Dd,
+  /// Fake-TLS ee.
+  Ee,
+}
+
+/// Стратегия failover между backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendFailoverStrategy {
+  #[default]
+  Priority,
+  RoundRobin,
+}
+
 /// Дополнительный MTProto-секрет с опциональным backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretEntry {
@@ -72,15 +92,31 @@ pub struct MtprotoConfig {
   pub secret: String,
   pub backend: String,
   #[serde(default)]
+  pub backends: Vec<String>,
+  #[serde(default)]
+  pub failover_strategy: BackendFailoverStrategy,
+  #[serde(default)]
   pub secrets: Vec<SecretEntry>,
 }
 
 impl MtprotoConfig {
+  /// Все уникальные backend: primary + список.
+  pub fn all_backends(&self) -> Vec<String> {
+    let mut result = vec![self.backend.clone()];
+    for backend in &self.backends {
+      if !result.contains(backend) {
+        result.push(backend.clone());
+      }
+    }
+    result
+  }
+
   /// Все секреты: основной + дополнительные.
   pub fn all_secrets(&self) -> Vec<SecretRoute> {
     let mut result = vec![SecretRoute {
       label: "default".into(),
       secret: self.secret.clone(),
+      mode: secret_mode(&self.secret),
       backend: self.backend.clone(),
       max_connections: 0,
     }];
@@ -88,6 +124,7 @@ impl MtprotoConfig {
       result.push(SecretRoute {
         label: entry.label.clone(),
         secret: entry.secret.clone(),
+        mode: secret_mode(&entry.secret),
         backend: entry
           .backend
           .clone()
@@ -104,6 +141,7 @@ impl MtprotoConfig {
 pub struct SecretRoute {
   pub label: String,
   pub secret: String,
+  pub mode: SecretMode,
   pub backend: String,
   pub max_connections: u32,
 }
@@ -149,6 +187,83 @@ impl Default for FragmentationConfig {
   }
 }
 
+/// Dynamic Record Sizing — имитация TLS record boundaries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrsConfig {
+  #[serde(default)]
+  pub enabled: bool,
+  #[serde(default = "default_drs_sizes")]
+  pub record_sizes: Vec<usize>,
+}
+
+fn default_drs_sizes() -> Vec<usize> {
+  vec![512, 1024, 1398, 256]
+}
+
+impl Default for DrsConfig {
+  fn default() -> Self {
+    Self {
+      enabled: false,
+      record_sizes: default_drs_sizes(),
+    }
+  }
+}
+
+/// Параметры dd-протокола (рандомизация размеров).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DdConfig {
+  #[serde(default = "default_dd_min")]
+  pub min_chunk_size: usize,
+  #[serde(default = "default_dd_max")]
+  pub max_chunk_size: usize,
+}
+
+fn default_dd_min() -> usize {
+  64
+}
+
+fn default_dd_max() -> usize {
+  1024
+}
+
+impl Default for DdConfig {
+  fn default() -> Self {
+    Self {
+      min_chunk_size: default_dd_min(),
+      max_chunk_size: default_dd_max(),
+    }
+  }
+}
+
+/// Webhook-уведомления.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhooksConfig {
+  #[serde(default)]
+  pub enabled: bool,
+  #[serde(default)]
+  pub urls: Vec<String>,
+  #[serde(default = "default_webhook_events")]
+  pub events: Vec<String>,
+}
+
+fn default_webhook_events() -> Vec<String> {
+  vec![
+    "config_reloaded".into(),
+    "secret_updated".into(),
+    "backend_failover".into(),
+  ]
+}
+
+impl Default for WebhooksConfig {
+  fn default() -> Self {
+    Self {
+      enabled: false,
+      urls: Vec::new(),
+      events: default_webhook_events(),
+    }
+  }
+}
+
 /// Безопасность и лимиты.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecurityConfig {
@@ -161,6 +276,9 @@ pub struct SecurityConfig {
   pub max_connections_per_ip: u32,
   #[serde(default)]
   pub ip_blacklist: Vec<String>,
+  /// Пустой список = разрешены все режимы (classic, dd, ee).
+  #[serde(default)]
+  pub allowed_protocols: Vec<String>,
 }
 
 fn default_antireplay_cache() -> usize {
@@ -174,6 +292,7 @@ impl Default for SecurityConfig {
       ja4_enforce: false,
       max_connections_per_ip: 0,
       ip_blacklist: Vec::new(),
+      allowed_protocols: Vec::new(),
     }
   }
 }
@@ -287,6 +406,10 @@ pub struct Config {
   #[serde(default)]
   pub fragmentation: FragmentationConfig,
   #[serde(default)]
+  pub drs: DrsConfig,
+  #[serde(default)]
+  pub dd: DdConfig,
+  #[serde(default)]
   pub security: SecurityConfig,
   #[serde(default)]
   pub network: NetworkConfig,
@@ -296,6 +419,8 @@ pub struct Config {
   pub admin: AdminConfig,
   #[serde(default)]
   pub webui: WebuiConfig,
+  #[serde(default)]
+  pub webhooks: WebhooksConfig,
 }
 
 impl Config {
@@ -365,6 +490,35 @@ impl Config {
       })?;
     }
 
+    if self.dd.min_chunk_size > self.dd.max_chunk_size {
+      return Err(StealthGateError::Config(
+        "dd.min_chunk_size не может быть больше dd.max_chunk_size".into(),
+      ));
+    }
+
+    if !self.drs.record_sizes.is_empty() && self.drs.record_sizes.contains(&0) {
+      return Err(StealthGateError::Config(
+        "drs.record_sizes не может содержать 0".into(),
+      ));
+    }
+
+    if self.mtproto.all_backends().is_empty() {
+      return Err(StealthGateError::Config("нужен хотя бы один backend".into()));
+    }
+
+    for secret in self
+      .mtproto
+      .all_secrets()
+      .iter()
+      .map(|route| route.secret.as_str())
+    {
+      if !is_protocol_allowed(secret, &self.security.allowed_protocols) {
+        return Err(StealthGateError::Config(format!(
+          "протокол секрета {secret} не разрешён allowed_protocols"
+        )));
+      }
+    }
+
     Ok(())
   }
 
@@ -384,6 +538,8 @@ impl Config {
       mtproto: MtprotoConfig {
         secret: "0123456789abcdef0123456789abcdef".into(),
         backend: "127.0.0.1:443".into(),
+        backends: Vec::new(),
+        failover_strategy: BackendFailoverStrategy::default(),
         secrets: Vec::new(),
       },
       fallback: FallbackConfig {
@@ -394,6 +550,8 @@ impl Config {
         fronting_port: 443,
       },
       fragmentation: FragmentationConfig::default(),
+      drs: DrsConfig::default(),
+      dd: DdConfig::default(),
       security: SecurityConfig::default(),
       network: NetworkConfig::default(),
       metrics: MetricsConfig::default(),
@@ -402,6 +560,7 @@ impl Config {
         users_file: users_file.into(),
         ..Default::default()
       },
+      webhooks: WebhooksConfig::default(),
     }
   }
 
@@ -409,6 +568,32 @@ impl Config {
   pub fn mtproto_secret_bytes(&self) -> Result<Vec<u8>> {
     decode_secret(&self.mtproto.secret)
   }
+}
+
+/// Определяет режим секрета по префиксу.
+pub fn secret_mode(secret: &str) -> SecretMode {
+  let normalized = secret.trim().to_ascii_lowercase();
+  if normalized.starts_with("dd") {
+    SecretMode::Dd
+  } else if normalized.starts_with("ee") {
+    SecretMode::Ee
+  } else {
+    SecretMode::Classic
+  }
+}
+
+/// Проверяет, разрешён ли протокол секрета.
+pub fn is_protocol_allowed(secret: &str, allowed: &[String]) -> bool {
+  if allowed.is_empty() {
+    return true;
+  }
+  let mode = secret_mode(secret);
+  let mode_name = match mode {
+    SecretMode::Dd => "dd",
+    SecretMode::Ee => "ee",
+    SecretMode::Classic => "classic",
+  };
+  allowed.iter().any(|value| value.eq_ignore_ascii_case(mode_name))
 }
 
 /// Декодирует hex-секрет MTProto.
@@ -462,6 +647,8 @@ mod tests {
       mtproto: MtprotoConfig {
         secret: "0123456789abcdef0123456789abcdef".into(),
         backend: "127.0.0.1:443".into(),
+        backends: Vec::new(),
+        failover_strategy: BackendFailoverStrategy::default(),
         secrets: Vec::new(),
       },
       fallback: FallbackConfig {
@@ -472,11 +659,14 @@ mod tests {
         fronting_port: 443,
       },
       fragmentation: FragmentationConfig::default(),
+      drs: DrsConfig::default(),
+      dd: DdConfig::default(),
       security: SecurityConfig::default(),
       network: NetworkConfig::default(),
       metrics: MetricsConfig::default(),
       admin: AdminConfig::default(),
       webui: WebuiConfig::default(),
+      webhooks: WebhooksConfig::default(),
     };
     assert!(config.validate().is_err());
   }

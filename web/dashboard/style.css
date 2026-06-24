@@ -238,6 +238,19 @@ th, td {
 
 .hidden { display: none; }
 
+.qr-wrap {
+  margin-top: 16px;
+  padding: 12px;
+  display: inline-block;
+  background: #fff;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+}
+
+.qr-wrap img {
+  display: block;
+}
+
 @media (max-width: 900px) {
   .layout { grid-template-columns: 1fr; }
   .sidebar { border-right: 0; border-bottom: 1px solid var(--border); }

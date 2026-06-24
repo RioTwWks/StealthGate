@@ -57,6 +57,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     .route("/config/mtproto", put(update_proxy_settings))
     .route("/config/fragmentation", put(update_fragmentation))
     .route("/proxy-link", get(proxy_link))
+    .route("/proxy-link/qr", get(proxy_link_qr))
     .route("/metrics", get(api_metrics))
     .route("/users", get(list_users).post(create_user))
     .route("/users/{username}", delete(delete_user))
@@ -234,6 +235,30 @@ async fn proxy_link(
   require_user(session).await?;
   let link = state.proxy_link().map_err(ApiError::from_stealth_gate)?;
   Ok(Json(serde_json::json!({ "link": link })))
+}
+
+fn render_proxy_qr_svg(link: &str) -> Result<String, ApiError> {
+  let code = qrcode::QrCode::new(link.as_bytes())
+    .map_err(|err| ApiError::bad_request(format!("QR: {err}")))?;
+  Ok(code
+    .render()
+    .min_dimensions(200, 200)
+    .dark_color(qrcode::render::svg::Color("#0f172a"))
+    .light_color(qrcode::render::svg::Color("#ffffff"))
+    .build())
+}
+
+async fn proxy_link_qr(
+  State(state): State<Arc<AppState>>,
+  session: Session,
+) -> Result<impl IntoResponse, ApiError> {
+  require_user(session).await?;
+  let link = state.proxy_link().map_err(ApiError::from_stealth_gate)?;
+  let svg = render_proxy_qr_svg(&link)?;
+  Ok((
+    [(axum::http::header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
+    svg,
+  ))
 }
 
 async fn api_metrics(
