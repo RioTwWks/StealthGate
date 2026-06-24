@@ -1,12 +1,17 @@
 pub mod acceptor;
 pub mod admin;
+pub mod antireplay;
 pub mod config;
 pub mod detector;
+pub mod domain_fronting;
 pub mod error;
 pub mod fallback;
 pub mod fragmentation;
 pub mod io_util;
+pub mod limits;
 pub mod mcp;
+pub mod metrics;
+pub mod network;
 pub mod proxy;
 pub mod state;
 pub mod tls;

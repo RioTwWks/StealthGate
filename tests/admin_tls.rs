@@ -3,43 +3,19 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use stealth_gate::config::TlsConfig;
 use stealth_gate::admin;
-use stealth_gate::config::{
-  AdminConfig, FallbackConfig, FragmentationConfig, ListenConfig, MtprotoConfig, TlsConfig,
-  WebuiConfig,
-};
 use stealth_gate::state::AppState;
 use stealth_gate::tls_server;
 use stealth_gate::Config;
 use tempfile::tempdir;
 
 fn sample_config(users_file: &str) -> Config {
-  Config {
-    listen: ListenConfig {
-      host: "127.0.0.1".into(),
-      port: 8443,
-    },
-    tls: TlsConfig {
-      cert_file: Some("certs/cert.pem".into()),
-      key_file: Some("certs/key.pem".into()),
-      fake_domain: "www.cloudflare.com".into(),
-      ja4_profile: None,
-    },
-    mtproto: MtprotoConfig {
-      secret: "0123456789abcdef0123456789abcdef".into(),
-      backend: "127.0.0.1:443".into(),
-    },
-    fallback: FallbackConfig {
-      upstream: None,
-      static_html: None,
-    },
-    fragmentation: FragmentationConfig::default(),
-    admin: AdminConfig::default(),
-    webui: WebuiConfig {
-      users_file: users_file.into(),
-      ..Default::default()
-    },
-  }
+  let mut config = Config::test_minimal(users_file);
+  config.tls.cert_file = Some("certs/cert.pem".into());
+  config.tls.key_file = Some("certs/key.pem".into());
+  config.tls.fake_domain = "www.cloudflare.com".into();
+  config
 }
 
 #[tokio::test]

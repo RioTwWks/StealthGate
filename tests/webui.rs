@@ -3,10 +3,6 @@
 use std::sync::Arc;
 
 use serde_json::Value;
-use stealth_gate::config::{
-  AdminConfig, FallbackConfig, FragmentationConfig, ListenConfig, MtprotoConfig, TlsConfig,
-  WebuiConfig,
-};
 use stealth_gate::state::AppState;
 use stealth_gate::web::build_webui_app;
 use stealth_gate::Config;
@@ -17,33 +13,10 @@ const SESSION_SECRET: &str = "integration-test-session-secret";
 const ADMIN_PASSWORD: &str = "admin123";
 
 fn sample_config(users_file: &str) -> Config {
-  Config {
-    listen: ListenConfig {
-      host: "127.0.0.1".into(),
-      port: 8443,
-    },
-    tls: TlsConfig {
-      cert_file: None,
-      key_file: None,
-      fake_domain: "example.com".into(),
-      ja4_profile: None,
-    },
-    mtproto: MtprotoConfig {
-      secret: "ee0123456789abcdef0123456789abcdef".into(),
-      backend: "127.0.0.1:443".into(),
-    },
-    fallback: FallbackConfig {
-      upstream: None,
-      static_html: None,
-    },
-    fragmentation: FragmentationConfig::default(),
-    admin: AdminConfig::default(),
-    webui: WebuiConfig {
-      users_file: users_file.into(),
-      session_secret: SESSION_SECRET.into(),
-      ..Default::default()
-    },
-  }
+  let mut config = Config::test_minimal(users_file);
+  config.mtproto.secret = "ee0123456789abcdef0123456789abcdef".into();
+  config.webui.session_secret = SESSION_SECRET.into();
+  config
 }
 
 async fn spawn_webui_test_server(state: Arc<AppState>) -> (String, CancellationToken) {

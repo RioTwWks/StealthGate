@@ -1,9 +1,10 @@
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
-use crate::config::FragmentationConfig;
+use crate::config::{FragmentationConfig, NetworkConfig};
 use crate::error::{Result, StealthGateError};
 use crate::fragmentation;
+use crate::network;
 use crate::state::Stats;
 
 /// Проксирует MTProto-трафик на backend Telegram.
@@ -12,11 +13,10 @@ pub async fn proxy_mtproto(
   initial_data: &[u8],
   backend: &str,
   frag_config: &FragmentationConfig,
+  network: &NetworkConfig,
   stats: &Stats,
 ) -> Result<()> {
-  let mut upstream = TcpStream::connect(backend)
-    .await
-    .map_err(|err| StealthGateError::Proxy(format!("подключение к {backend}: {err}")))?;
+  let mut upstream = network::connect_backend(backend, network).await?;
 
   fragmentation::write_to_backend(&mut upstream, initial_data, frag_config, stats).await?;
   stats

@@ -4,7 +4,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use crate::config::FallbackConfig;
+use crate::domain_fronting::{forward_tcp, resolve_fronting_target};
 use crate::error::{Result, StealthGateError};
+use crate::state::Stats;
 
 const DEFAULT_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">
@@ -30,7 +32,17 @@ pub async fn handle_fallback(
   client: TcpStream,
   initial_data: &[u8],
   config: &FallbackConfig,
+  sni: Option<&str>,
+  stats: &Stats,
 ) -> Result<()> {
+  if let Some(target) = resolve_fronting_target(config, sni) {
+    stats
+      .domain_fronted
+      .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tracing::debug!(target = %target, "domain fronting");
+    return forward_tcp(client, initial_data, &target).await;
+  }
+
   if let Some(upstream) = &config.upstream {
     return proxy_to_upstream(client, initial_data, upstream).await;
   }
@@ -51,7 +63,6 @@ async fn serve_static_html(
   let html = resolve_html(static_html);
   let body = html.as_bytes();
 
-  // Если клиент уже отправил HTTP-запрос — отвечаем на него.
   let is_http = initial_data.starts_with(b"GET ")
     || initial_data.starts_with(b"HEAD ")
     || initial_data.starts_with(b"POST ");
@@ -73,9 +84,7 @@ async fn serve_static_html(
     return Ok(());
   }
 
-  // Для TLS-сканеров отдаём TLS alert (некорректный handshake).
   if initial_data.first() == Some(&0x16) {
-    // TLS Alert: level=fatal(2), description=unexpected_message(10)
     let alert = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x0a];
     client
       .write_all(&alert)
@@ -84,7 +93,6 @@ async fn serve_static_html(
     return Ok(());
   }
 
-  // Прочий трафик — простой HTTP-ответ.
   let response = format!(
     "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
     body.len()
@@ -117,29 +125,11 @@ fn resolve_html(static_html: Option<&str>) -> String {
 }
 
 async fn proxy_to_upstream(
-  mut client: TcpStream,
+  client: TcpStream,
   initial_data: &[u8],
   upstream: &str,
 ) -> Result<()> {
-  let mut upstream_stream = TcpStream::connect(upstream)
-    .await
-    .map_err(|err| StealthGateError::Proxy(format!("подключение к upstream {upstream}: {err}")))?;
-
-  upstream_stream
-    .write_all(initial_data)
-    .await
-    .map_err(|err| StealthGateError::Proxy(format!("запись в upstream: {err}")))?;
-
-  let (mut client_read, mut client_write) = client.split();
-  let (mut upstream_read, mut upstream_write) = upstream_stream.split();
-
-  let c2u = tokio::io::copy(&mut client_read, &mut upstream_write);
-  let u2c = tokio::io::copy(&mut upstream_read, &mut client_write);
-
-  tokio::try_join!(c2u, u2c)
-    .map_err(|err| StealthGateError::Proxy(format!("ошибка upstream proxy: {err}")))?;
-
-  Ok(())
+  forward_tcp(client, initial_data, upstream).await
 }
 
 #[cfg(test)]

@@ -1,10 +1,13 @@
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 
+use crate::antireplay::AntiReplayCache;
 use crate::config::{Config, FragmentationConfig, MtprotoConfig};
 use crate::error::{Result, StealthGateError};
+use crate::limits::ConnectionLimiter;
 use crate::users::UserStore;
 
 /// Счётчики прокси в реальном времени.
@@ -17,6 +20,8 @@ pub struct Stats {
   pub bytes_from_backend: AtomicU64,
   pub tls_handshakes: AtomicU64,
   pub fragmented_writes: AtomicU64,
+  pub replay_blocked: AtomicU64,
+  pub domain_fronted: AtomicU64,
 }
 
 impl Stats {
@@ -30,12 +35,14 @@ impl Stats {
       bytes_from_backend: self.bytes_from_backend.load(Ordering::Relaxed),
       tls_handshakes: self.tls_handshakes.load(Ordering::Relaxed),
       fragmented_writes: self.fragmented_writes.load(Ordering::Relaxed),
+      replay_blocked: self.replay_blocked.load(Ordering::Relaxed),
+      domain_fronted: self.domain_fronted.load(Ordering::Relaxed),
     }
   }
 }
 
 /// Сериализуемый снимок статистики.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatsSnapshot {
   pub total_connections: u64,
   pub mtproto_connections: u64,
@@ -44,6 +51,8 @@ pub struct StatsSnapshot {
   pub bytes_from_backend: u64,
   pub tls_handshakes: u64,
   pub fragmented_writes: u64,
+  pub replay_blocked: u64,
+  pub domain_fronted: u64,
 }
 
 /// Разделяемое состояние прокси.
@@ -52,6 +61,8 @@ pub struct AppState {
   pub config_path: String,
   pub stats: Stats,
   pub users: Arc<UserStore>,
+  pub antireplay: AntiReplayCache,
+  pub limits: ConnectionLimiter,
 }
 
 impl AppState {
@@ -59,12 +70,32 @@ impl AppState {
   pub fn new(config: Config, config_path: impl Into<String>) -> Result<Arc<Self>> {
     let config_path = config_path.into();
     let users = UserStore::load(&config.webui.users_file)?;
+    let antireplay = AntiReplayCache::new(config.security.antireplay_cache_size);
     Ok(Arc::new(Self {
       config: RwLock::new(config),
       config_path,
       stats: Stats::default(),
       users,
+      antireplay,
+      limits: ConnectionLimiter::default(),
     }))
+  }
+
+  /// IP blacklist из конфигурации.
+  pub fn ip_blacklist(&self) -> Result<Vec<IpAddr>> {
+    let config = self
+      .config
+      .read()
+      .map_err(|_| StealthGateError::Config("блокировка config poisoned".into()))?;
+    config
+      .security
+      .ip_blacklist
+      .iter()
+      .map(|ip| {
+        ip.parse()
+          .map_err(|err| StealthGateError::Config(format!("blacklist IP {ip}: {err}")))
+      })
+      .collect()
   }
 
   /// Перечитывает конфигурацию с диска.
@@ -122,6 +153,9 @@ impl AppState {
   /// Обновляет только MTProto-секцию (admin API).
   pub fn update_mtproto(&self, mtproto: MtprotoConfig) -> Result<()> {
     crate::config::decode_secret(&mtproto.secret)?;
+    for entry in &mtproto.secrets {
+      crate::config::decode_secret(&entry.secret)?;
+    }
     {
       let mut config = self
         .config
@@ -143,6 +177,18 @@ impl AppState {
     self.save_config()
   }
 
+  /// Ссылка tg://proxy для текущего listen/secret.
+  pub fn proxy_link(&self) -> Result<String> {
+    let config = self
+      .config
+      .read()
+      .map_err(|_| StealthGateError::Config("блокировка config poisoned".into()))?;
+    Ok(format!(
+      "tg://proxy?server={}&port={}&secret={}",
+      config.listen.host, config.listen.port, config.mtproto.secret
+    ))
+  }
+
   /// Краткая сводка конфигурации для admin/MCP/WebUI.
   pub fn config_summary(&self) -> Result<ConfigSummary> {
     let config = self
@@ -154,13 +200,18 @@ impl AppState {
       fake_domain: config.tls.fake_domain.clone(),
       backend: config.mtproto.backend.clone(),
       secret_prefix: config.mtproto.secret.chars().take(4).collect(),
+      secrets_count: 1 + config.mtproto.secrets.len(),
       tls_enabled: config.tls.is_enabled(),
       fragmentation_enabled: config.fragmentation.enabled,
       fragmentation_delay_ms: config.fragmentation.delay_ms,
       fragmentation_chunk_sizes: config.fragmentation.chunk_sizes.clone(),
+      domain_fronting: format!("{:?}", config.fallback.domain_fronting).to_lowercase(),
+      socks5_proxy: config.network.socks5_proxy.clone(),
       admin_socket: config.admin.socket.clone(),
       webui_enabled: config.webui.enabled,
       webui_listen: format!("{}:{}", config.webui.host, config.webui.port),
+      metrics_enabled: config.metrics.enabled,
+      metrics_listen: format!("{}:{}", config.metrics.host, config.metrics.port),
     })
   }
 
@@ -181,13 +232,18 @@ pub struct ConfigSummary {
   pub fake_domain: String,
   pub backend: String,
   pub secret_prefix: String,
+  pub secrets_count: usize,
   pub tls_enabled: bool,
   pub fragmentation_enabled: bool,
   pub fragmentation_delay_ms: u64,
   pub fragmentation_chunk_sizes: Vec<usize>,
+  pub domain_fronting: String,
+  pub socks5_proxy: Option<String>,
   pub admin_socket: Option<String>,
   pub webui_enabled: bool,
   pub webui_listen: String,
+  pub metrics_enabled: bool,
+  pub metrics_listen: String,
 }
 
 /// Данные сессии WebUI.
@@ -201,39 +257,11 @@ pub struct SessionUser {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::config::{
-    AdminConfig, FallbackConfig, FragmentationConfig, ListenConfig, MtprotoConfig, TlsConfig,
-    WebuiConfig,
-  };
+  use crate::config::Config;
   use tempfile::tempdir;
 
   fn sample_config(users_file: &str) -> Config {
-    Config {
-      listen: ListenConfig {
-        host: "127.0.0.1".into(),
-        port: 8443,
-      },
-      tls: TlsConfig {
-        cert_file: None,
-        key_file: None,
-        fake_domain: "example.com".into(),
-        ja4_profile: None,
-      },
-      mtproto: MtprotoConfig {
-        secret: "0123456789abcdef0123456789abcdef".into(),
-        backend: "127.0.0.1:443".into(),
-      },
-      fallback: FallbackConfig {
-        upstream: None,
-        static_html: None,
-      },
-      fragmentation: FragmentationConfig::default(),
-      admin: AdminConfig::default(),
-      webui: WebuiConfig {
-        users_file: users_file.into(),
-        ..Default::default()
-      },
-    }
+    Config::test_minimal(users_file)
   }
 
   #[test]
