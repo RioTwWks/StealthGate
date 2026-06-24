@@ -21,6 +21,7 @@ fn test_config() -> Arc<Config> {
       cert_file: None,
       key_file: None,
       fake_domain: "www.cloudflare.com".into(),
+      ja4_profile: None,
     },
     mtproto: stealth_gate::config::MtprotoConfig {
       secret: "ee0123456789abcdef0123456789abcdef".into(),
@@ -30,6 +31,8 @@ fn test_config() -> Arc<Config> {
       upstream: None,
       static_html: None,
     },
+    fragmentation: stealth_gate::config::FragmentationConfig::default(),
+    admin: stealth_gate::config::AdminConfig::default(),
   })
 }
 

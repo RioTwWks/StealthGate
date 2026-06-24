@@ -1,10 +1,9 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use stealth_gate::{run_acceptor, Config, Result};
+use stealth_gate::{run_acceptor, AppState, Config, Result};
 
 /// Fake TLS MTProto-прокси.
 #[derive(Debug, Parser)]
@@ -24,14 +23,26 @@ async fn main() -> Result<()> {
     .init();
 
   let args = Args::parse();
-  let config = Arc::new(Config::from_file(&args.config)?);
+  stealth_gate::tls_server::init_rustls();
+  let config = Config::from_file(&args.config)?;
+  let config_path = args.config.to_string_lossy().to_string();
+  let state = AppState::new(config, config_path);
 
-  tracing::info!(
-    listen = %config.listen.socket_addr()?,
-    backend = %config.mtproto.backend,
-    fake_domain = %config.tls.fake_domain,
-    "запуск StealthGate"
-  );
+  {
+    let cfg = state
+      .config
+      .read()
+      .map_err(|_| stealth_gate::StealthGateError::Config("блокировка config poisoned".into()))?;
+    tracing::info!(
+      listen = %cfg.listen.socket_addr()?,
+      backend = %cfg.mtproto.backend,
+      fake_domain = %cfg.tls.fake_domain,
+      tls_termination = cfg.tls.is_enabled(),
+      fragmentation = cfg.fragmentation.enabled,
+      admin_socket = ?cfg.admin.socket,
+      "запуск StealthGate"
+    );
+  }
 
-  run_acceptor(config).await
+  run_acceptor(state).await
 }

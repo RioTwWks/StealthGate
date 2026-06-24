@@ -1,6 +1,6 @@
 [package]
 name = "stealth-gate"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Fake TLS MTProto-прокси на Rust"
 license = "MIT"
@@ -10,6 +10,10 @@ readme = "README.md"
 name = "stealth-gate"
 path = "src/bin/stealth-gate.rs"
 
+[[bin]]
+name = "stealth-gate-mcp"
+path = "src/bin/stealth-gate-mcp.rs"
+
 [lib]
 name = "stealth_gate"
 path = "src/lib.rs"
@@ -17,15 +21,25 @@ path = "src/lib.rs"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 hex = "0.4"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+sha2 = "0.10"
+rmcp = { version = "0.16", features = ["server", "transport-io", "schemars"] }
+schemars = "1"
+anyhow = "1"
 
 [dev-dependencies]
 tokio-test = "0.4"
+rcgen = "0.14"
+tempfile = "3"
 
 [profile.release]
 lto = true
