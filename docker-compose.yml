@@ -19,7 +19,7 @@ services:
     ports:
       - "443:443"
     environment:
-      - CONFIG_PATH=/app/configs/config.yaml
+      - RUST_LOG=info
     volumes:
       - ./configs:/app/configs:ro
     depends_on:

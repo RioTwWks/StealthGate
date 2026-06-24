@@ -1,0 +1,16 @@
+[listen]
+host = "0.0.0.0"
+port = 443
+
+[tls]
+# cert_file и key_file зарезервированы для будущей полноценной TLS-терминации
+fake_domain = "www.cloudflare.com"
+
+[mtproto]
+# Секрет с префиксом ee — режим fake TLS
+secret = "ee0123456789abcdef0123456789abcdef"
+backend = "149.154.167.99:443"
+
+[fallback]
+# upstream = "127.0.0.1:8080"
+static_html = "web/index.html"
