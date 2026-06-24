@@ -156,7 +156,7 @@ cargo test -- --ignored       # сетевые интеграционные
 
 Готовый конфиг MCP для проекта: [`.cursor/mcp.json`](.cursor/mcp.json).
 
-Подробнее: [docs/ROADMAP.md](docs/ROADMAP.md) — статус фич v0.4.0.
+Подробнее: [docs/ROADMAP.md](docs/ROADMAP.md) — статус фич v0.5.0.
 
 ## 📄 Лицензия
 

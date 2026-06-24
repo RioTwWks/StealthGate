@@ -9,7 +9,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::admin;
 use crate::antireplay::client_hello_fingerprint;
-use crate::config::Config;
+use crate::config::{Config, SecretMode};
 use crate::detector::{DetectionResult, Detector, TrafficType};
 use crate::domain_fronting::{forward_tcp, resolve_fronting_target};
 use crate::error::{Result, StealthGateError};
@@ -135,6 +135,7 @@ fn detect_with_security(
         traffic_type: TrafficType::Fallback,
         sni,
         secret_label: None,
+        secret_mode: None,
         backend: None,
         max_connections: 0,
       });
@@ -161,6 +162,7 @@ fn detect_with_security(
     tracing::info!("JA4 enforce: соединение переведено в fallback");
     detection.traffic_type = TrafficType::Fallback;
     detection.secret_label = None;
+    detection.secret_mode = None;
     detection.backend = None;
     detection.max_connections = 0;
   }
@@ -181,22 +183,45 @@ async fn handle_mtproto(
     .as_deref()
     .filter(|value| !value.is_empty())
     .unwrap_or(&ctx.default_backend);
+  let secret_mode = detection
+    .secret_mode
+    .unwrap_or(SecretMode::Classic);
+
+  let (drs, dd, webhooks) = {
+    let config = state
+      .config
+      .read()
+      .map_err(|_| StealthGateError::Config("блокировка config poisoned".into()))?;
+    (
+      config.drs.clone(),
+      config.dd.clone(),
+      config.webhooks.clone(),
+    )
+  };
 
   tracing::info!(
     sni = ?detection.sni,
     backend = %backend,
     secret = ?detection.secret_label,
+    ?secret_mode,
     fragmented = ctx.fragmentation.enabled,
+    drs = drs.enabled,
     "MTProto-соединение"
   );
 
   proxy::proxy_mtproto(
     client,
     peek_buf,
-    backend,
-    &ctx.fragmentation,
-    &ctx.network,
-    &state.stats,
+    state,
+    &proxy::MtprotoProxyOptions {
+      preferred_backend: backend,
+      secret_mode,
+      fragmentation: &ctx.fragmentation,
+      drs: &drs,
+      dd: &dd,
+      network: &ctx.network,
+      webhooks: &webhooks,
+    },
   )
   .await
 }
@@ -322,6 +347,17 @@ pub async fn run_acceptor(state: Arc<AppState>) -> Result<()> {
 
   crate::web::spawn_webui(Arc::clone(&state));
   metrics::spawn_metrics(Arc::clone(&state));
+
+  {
+    let webhooks = {
+      let config = state
+        .config
+        .read()
+        .map_err(|_| StealthGateError::Config("блокировка config poisoned".into()))?;
+      config.webhooks.clone()
+    };
+    crate::webhooks::dispatch(&webhooks, crate::webhooks::WebhookEvent::ProxyStarted, None);
+  }
 
   let listener = tokio::net::TcpListener::bind(listen_addr)
     .await

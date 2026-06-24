@@ -39,6 +39,13 @@ pub fn render_prometheus(state: &AppState) -> String {
     "stealthgate_fragmented_writes_total",
     stats.fragmented_writes,
   );
+  append_counter(&mut out, "stealthgate_drs_writes_total", stats.drs_writes);
+  append_counter(&mut out, "stealthgate_dd_writes_total", stats.dd_writes);
+  append_counter(
+    &mut out,
+    "stealthgate_backend_failovers_total",
+    stats.backend_failovers,
+  );
   append_counter(
     &mut out,
     "stealthgate_replay_blocked_total",
@@ -64,6 +71,16 @@ pub fn render_prometheus(state: &AppState) -> String {
     } else {
       0
     },
+  );
+  append_gauge(
+    &mut out,
+    "stealthgate_drs_enabled",
+    if summary.drs_enabled { 1 } else { 0 },
+  );
+  append_gauge(
+    &mut out,
+    "stealthgate_webhooks_enabled",
+    if summary.webhooks_enabled { 1 } else { 0 },
   );
   }
 

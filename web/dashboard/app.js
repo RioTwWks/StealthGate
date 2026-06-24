@@ -85,6 +85,9 @@ function renderStats(stats) {
     ['Replay blocked', stats.replay_blocked ?? 0],
     ['TLS handshakes', stats.tls_handshakes],
     ['Фрагментаций', stats.fragmented_writes],
+    ['DRS записей', stats.drs_writes ?? 0],
+    ['dd записей', stats.dd_writes ?? 0],
+    ['Backend failover', stats.backend_failovers ?? 0],
     ['Bytes → backend', stats.bytes_to_backend],
     ['Bytes ← backend', stats.bytes_from_backend],
   ];
@@ -144,6 +147,10 @@ async function initDashboardPage() {
     const linkInput = document.getElementById('proxy-link');
     if (linkInput && proxy?.link) {
       linkInput.value = proxy.link;
+      const qrImg = document.getElementById('proxy-qr');
+      if (qrImg) {
+        qrImg.src = `${API}/proxy-link/qr`;
+      }
       document.getElementById('copy-proxy-link')?.addEventListener('click', async () => {
         await navigator.clipboard.writeText(proxy.link);
         showMessage('dashboard-message', 'Ссылка скопирована');

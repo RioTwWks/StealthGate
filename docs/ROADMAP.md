@@ -1,6 +1,6 @@
 # Roadmap StealthGate
 
-Статус реализации по фазам (v0.4.0).
+Статус реализации по фазам (v0.5.0).
 
 ## Phase 1 — DPI-устойчивость
 
@@ -9,8 +9,8 @@
 | Domain fronting (SNI/fixed) | ✅ | `fallback.domain_fronting` |
 | Anti-replay cache | ✅ | `security.antireplay_cache_size` |
 | JA4 enforce | ✅ | `security.ja4_enforce` |
-| Dynamic Record Sizing | ⏳ | Планируется v0.5 |
-| Полный dd-режим MTProto | ⏳ | Планируется v0.5 |
+| Dynamic Record Sizing | ✅ | `[drs]` — имитация TLS record boundaries |
+| Полный dd-режим MTProto | ✅ | префикс `dd` + `[dd]` min/max chunk |
 
 ## Phase 2 — Production
 
@@ -25,7 +25,7 @@
 | Config validate | ✅ | при load/save |
 | CI GitHub Actions | ✅ | `.github/workflows/ci.yml` |
 | systemd unit | ✅ | `deploy/stealth-gate.service` |
-| Multi-backend failover | ⏳ | v0.5 |
+| Multi-backend failover | ✅ | `mtproto.backends`, `failover_strategy` |
 
 ## Phase 3 — Differentiation
 
@@ -36,29 +36,37 @@
 | WebUI `/api/proxy-link` | ✅ | REST |
 | WebUI `/api/metrics` | ✅ | Prometheus для авторизованных |
 | E2E domain fronting test | ✅ | `tests/domain_fronting.rs` |
-| WebUI QR-код | ⏳ | v0.5 |
-| Webhook alerts | ⏳ | v0.5 |
+| WebUI QR-код | ✅ | `GET /api/proxy-link/qr` (SVG) |
+| Webhook alerts | ✅ | `[webhooks]` config/secret/failover/start |
 | Front/Back split | ⏳ | v0.6 |
 
-## Запуск новых возможностей
+## Запуск новых возможностей v0.5
 
 ```bash
-# Domain fronting на реальный HTTPS из SNI
-[fallback]
-domain_fronting = "sni"
-
-# Anti-replay + лимиты
-[security]
-antireplay_cache_size = 65536
-max_connections_per_ip = 50
-
-# SOCKS5 к Telegram через Tor
-[network]
-socks5_proxy = "socks5://127.0.0.1:9050"
-
-# Prometheus
-[metrics]
+# Dynamic Record Sizing (вместо фрагментации для classic/ee)
+[drs]
 enabled = true
+record_sizes = [512, 1024, 1398, 256]
+
+# dd-секрет (рандомные размеры чанков)
+[mtproto]
+secret = "dd0123456789abcdef0123456789abcdef"
+
+[dd]
+min_chunk_size = 64
+max_chunk_size = 1024
+
+# Multi-backend failover
+[mtproto]
+backend = "149.154.167.99:443"
+backends = ["149.154.175.50:443"]
+failover_strategy = "priority"  # или round_robin
+
+# Webhooks
+[webhooks]
+enabled = true
+urls = ["https://hooks.example.com/stealthgate"]
+events = ["config_reloaded", "secret_updated", "backend_failover", "proxy_started"]
 ```
 
 См. также: [WEBUI.md](./WEBUI.md), [MCP.md](./MCP.md), [CURSOR.md](./CURSOR.md).

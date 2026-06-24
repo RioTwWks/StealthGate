@@ -1,7 +1,10 @@
 pub mod acceptor;
 pub mod admin;
 pub mod antireplay;
+pub mod backend_pool;
 pub mod config;
+pub mod dd_protocol;
+pub mod drs;
 pub mod detector;
 pub mod domain_fronting;
 pub mod error;
@@ -18,6 +21,7 @@ pub mod tls;
 pub mod tls_server;
 pub mod users;
 pub mod web;
+pub mod webhooks;
 
 pub use acceptor::run_acceptor;
 pub use config::Config;

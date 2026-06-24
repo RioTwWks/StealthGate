@@ -12,6 +12,9 @@ fake_domain = "www.cloudflare.com"
 [mtproto]
 secret = "ee0123456789abcdef0123456789abcdef"
 backend = "149.154.167.99:443"
+# Дополнительные DC для failover (приоритет: backend, затем backends)
+backends = ["149.154.175.50:443", "149.154.175.100:443"]
+failover_strategy = "priority"  # priority | round_robin
 
 # Дополнительные секреты (опционально)
 # [[mtproto.secrets]]
@@ -31,6 +34,19 @@ fronting_port = 443
 enabled = true
 chunk_sizes = [1, 2, 3, 2, 1]
 delay_ms = 0
+
+[drs]
+enabled = false
+record_sizes = [512, 1024, 1398, 256]
+
+[dd]
+min_chunk_size = 64
+max_chunk_size = 1024
+
+[webhooks]
+enabled = false
+urls = []
+events = ["config_reloaded", "secret_updated", "backend_failover", "proxy_started"]
 
 [security]
 antireplay_cache_size = 65536

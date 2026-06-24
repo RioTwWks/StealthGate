@@ -5,10 +5,12 @@ use std::sync::{Arc, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::antireplay::AntiReplayCache;
-use crate::config::{Config, FragmentationConfig, MtprotoConfig};
+use crate::backend_pool::BackendPool;
+use crate::config::{Config, FragmentationConfig, MtprotoConfig, WebhooksConfig};
 use crate::error::{Result, StealthGateError};
 use crate::limits::ConnectionLimiter;
 use crate::users::UserStore;
+use crate::webhooks::{dispatch, WebhookEvent};
 
 /// Счётчики прокси в реальном времени.
 #[derive(Debug, Default)]
@@ -20,6 +22,9 @@ pub struct Stats {
   pub bytes_from_backend: AtomicU64,
   pub tls_handshakes: AtomicU64,
   pub fragmented_writes: AtomicU64,
+  pub drs_writes: AtomicU64,
+  pub dd_writes: AtomicU64,
+  pub backend_failovers: AtomicU64,
   pub replay_blocked: AtomicU64,
   pub domain_fronted: AtomicU64,
 }
@@ -35,6 +40,9 @@ impl Stats {
       bytes_from_backend: self.bytes_from_backend.load(Ordering::Relaxed),
       tls_handshakes: self.tls_handshakes.load(Ordering::Relaxed),
       fragmented_writes: self.fragmented_writes.load(Ordering::Relaxed),
+      drs_writes: self.drs_writes.load(Ordering::Relaxed),
+      dd_writes: self.dd_writes.load(Ordering::Relaxed),
+      backend_failovers: self.backend_failovers.load(Ordering::Relaxed),
       replay_blocked: self.replay_blocked.load(Ordering::Relaxed),
       domain_fronted: self.domain_fronted.load(Ordering::Relaxed),
     }
@@ -51,6 +59,9 @@ pub struct StatsSnapshot {
   pub bytes_from_backend: u64,
   pub tls_handshakes: u64,
   pub fragmented_writes: u64,
+  pub drs_writes: u64,
+  pub dd_writes: u64,
+  pub backend_failovers: u64,
   pub replay_blocked: u64,
   pub domain_fronted: u64,
 }
@@ -63,6 +74,7 @@ pub struct AppState {
   pub users: Arc<UserStore>,
   pub antireplay: AntiReplayCache,
   pub limits: ConnectionLimiter,
+  pub backend_pool: RwLock<Arc<BackendPool>>,
 }
 
 impl AppState {
@@ -71,6 +83,7 @@ impl AppState {
     let config_path = config_path.into();
     let users = UserStore::load(&config.webui.users_file)?;
     let antireplay = AntiReplayCache::new(config.security.antireplay_cache_size);
+    let backend_pool = Arc::new(BackendPool::from_config(&config.mtproto));
     Ok(Arc::new(Self {
       config: RwLock::new(config),
       config_path,
@@ -78,7 +91,32 @@ impl AppState {
       users,
       antireplay,
       limits: ConnectionLimiter::default(),
+      backend_pool: RwLock::new(backend_pool),
     }))
+  }
+
+  fn webhooks_config(&self) -> Result<WebhooksConfig> {
+    let config = self
+      .config
+      .read()
+      .map_err(|_| StealthGateError::Config("блокировка config poisoned".into()))?;
+    Ok(config.webhooks.clone())
+  }
+
+  fn sync_backend_pool(&self) -> Result<()> {
+    let mtproto = {
+      let config = self
+        .config
+        .read()
+        .map_err(|_| StealthGateError::Config("блокировка config poisoned".into()))?;
+      config.mtproto.clone()
+    };
+    let mut pool = self
+      .backend_pool
+      .write()
+      .map_err(|_| StealthGateError::Config("блокировка backend_pool poisoned".into()))?;
+    *pool = Arc::new(BackendPool::from_config(&mtproto));
+    Ok(())
   }
 
   /// IP blacklist из конфигурации.
@@ -105,6 +143,12 @@ impl AppState {
       .config
       .write()
       .map_err(|_| StealthGateError::Config("блокировка config poisoned".into()))? = fresh;
+    self.sync_backend_pool()?;
+    dispatch(
+      &self.webhooks_config()?,
+      WebhookEvent::ConfigReloaded,
+      None,
+    );
     Ok(())
   }
 
@@ -127,7 +171,13 @@ impl AppState {
         .map_err(|_| StealthGateError::Config("блокировка config poisoned".into()))?;
       config.mtproto.secret = secret;
     }
-    self.save_config()
+    self.save_config()?;
+    dispatch(
+      &self.webhooks_config()?,
+      WebhookEvent::SecretUpdated,
+      None,
+    );
+    Ok(())
   }
 
   /// Обновляет MTProto backend и домен маскировки.
@@ -147,7 +197,14 @@ impl AppState {
       config.mtproto.backend = backend;
       config.tls.fake_domain = fake_domain;
     }
-    self.save_config()
+    self.save_config()?;
+    self.sync_backend_pool()?;
+    dispatch(
+      &self.webhooks_config()?,
+      WebhookEvent::SecretUpdated,
+      None,
+    );
+    Ok(())
   }
 
   /// Обновляет только MTProto-секцию (admin API).
@@ -163,7 +220,9 @@ impl AppState {
         .map_err(|_| StealthGateError::Config("блокировка config poisoned".into()))?;
       config.mtproto = mtproto;
     }
-    self.save_config()
+    self.save_config()?;
+    self.sync_backend_pool()?;
+    Ok(())
   }
 
   /// Обновляет настройки фрагментации.
@@ -205,6 +264,10 @@ impl AppState {
       fragmentation_enabled: config.fragmentation.enabled,
       fragmentation_delay_ms: config.fragmentation.delay_ms,
       fragmentation_chunk_sizes: config.fragmentation.chunk_sizes.clone(),
+      drs_enabled: config.drs.enabled,
+      backends_count: config.mtproto.all_backends().len(),
+      failover_strategy: format!("{:?}", config.mtproto.failover_strategy).to_lowercase(),
+      webhooks_enabled: config.webhooks.enabled,
       domain_fronting: format!("{:?}", config.fallback.domain_fronting).to_lowercase(),
       socks5_proxy: config.network.socks5_proxy.clone(),
       admin_socket: config.admin.socket.clone(),
@@ -237,6 +300,10 @@ pub struct ConfigSummary {
   pub fragmentation_enabled: bool,
   pub fragmentation_delay_ms: u64,
   pub fragmentation_chunk_sizes: Vec<usize>,
+  pub drs_enabled: bool,
+  pub backends_count: usize,
+  pub failover_strategy: String,
+  pub webhooks_enabled: bool,
   pub domain_fronting: String,
   pub socks5_proxy: Option<String>,
   pub admin_socket: Option<String>,
