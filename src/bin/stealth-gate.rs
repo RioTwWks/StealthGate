@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
   stealth_gate::tls_server::init_rustls();
   let config = Config::from_file(&args.config)?;
   let config_path = args.config.to_string_lossy().to_string();
-  let state = AppState::new(config, config_path);
+  let state = AppState::new(config, config_path)?;
 
   {
     let cfg = state
@@ -40,6 +40,8 @@ async fn main() -> Result<()> {
       tls_termination = cfg.tls.is_enabled(),
       fragmentation = cfg.fragmentation.enabled,
       admin_socket = ?cfg.admin.socket,
+      webui = cfg.webui.enabled,
+      webui_listen = %cfg.webui.socket_addr()?,
       "запуск StealthGate"
     );
   }

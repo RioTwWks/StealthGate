@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>StealthGate — Пользователи</title>
+  <link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand compact">
+        <div class="brand-mark">SG</div>
+        <strong>StealthGate</strong>
+      </div>
+      <nav class="nav">
+        <a class="nav-link" href="/ui/dashboard.html">Дашборд</a>
+        <a class="nav-link active" href="/ui/users.html" data-role="admin">Пользователи</a>
+      </nav>
+      <div class="sidebar-footer">
+        <div id="current-user" class="muted"></div>
+        <button id="logout-btn" class="btn ghost">Выйти</button>
+      </div>
+    </aside>
+
+    <main class="content">
+      <header class="page-header">
+        <div>
+          <h1>Пользователи</h1>
+          <p class="muted">Управление доступом к WebUI</p>
+        </div>
+      </header>
+
+      <section class="panel">
+        <h2>Создать пользователя</h2>
+        <form id="create-user-form" class="form-grid">
+          <label>
+            Логин
+            <input type="text" name="username" required>
+          </label>
+          <label>
+            Отображаемое имя
+            <input type="text" name="display_name" required>
+          </label>
+          <label>
+            Пароль
+            <input type="password" name="password" required>
+          </label>
+          <label>
+            Роль
+            <select name="role">
+              <option value="viewer">viewer</option>
+              <option value="operator">operator</option>
+              <option value="admin">admin</option>
+            </select>
+          </label>
+          <div class="form-actions">
+            <button type="submit" class="btn primary">Создать</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel">
+        <h2>Список пользователей</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Логин</th>
+                <th>Имя</th>
+                <th>Роль</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="users-table"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <p id="users-message" class="message hidden"></p>
+    </main>
+  </div>
+  <script src="/ui/app.js"></script>
+  <script>
+    initUsersPage();
+  </script>
+</body>
+</html>

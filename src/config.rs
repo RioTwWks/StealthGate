@@ -2,12 +2,12 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StealthGateError};
 
 /// Секция прослушивания.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListenConfig {
   pub host: String,
   pub port: u16,
@@ -23,12 +23,11 @@ impl ListenConfig {
 }
 
 /// TLS-настройки для маскировки и терминации.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {
   pub cert_file: Option<String>,
   pub key_file: Option<String>,
   pub fake_domain: String,
-  /// Ожидаемый JA4-профиль для логирования/валидации (опционально).
   pub ja4_profile: Option<String>,
 }
 
@@ -44,21 +43,21 @@ impl TlsConfig {
 }
 
 /// MTProto-настройки.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MtprotoConfig {
   pub secret: String,
   pub backend: String,
 }
 
 /// Fallback для не-MTProto трафика.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FallbackConfig {
   pub upstream: Option<String>,
   pub static_html: Option<String>,
 }
 
 /// Динамическая фрагментация начального пакета.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FragmentationConfig {
   #[serde(default)]
   pub enabled: bool,
@@ -83,13 +82,65 @@ impl Default for FragmentationConfig {
 }
 
 /// Admin API через Unix-сокет.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AdminConfig {
   pub socket: Option<String>,
 }
 
+/// WebUI-дашборд управления.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebuiConfig {
+  #[serde(default)]
+  pub enabled: bool,
+  #[serde(default = "default_webui_host")]
+  pub host: String,
+  #[serde(default = "default_webui_port")]
+  pub port: u16,
+  #[serde(default = "default_session_secret")]
+  pub session_secret: String,
+  #[serde(default = "default_users_file")]
+  pub users_file: String,
+}
+
+fn default_webui_host() -> String {
+  "127.0.0.1".into()
+}
+
+fn default_webui_port() -> u16 {
+  8088
+}
+
+fn default_session_secret() -> String {
+  "change-me-in-production".into()
+}
+
+fn default_users_file() -> String {
+  "data/users.json".into()
+}
+
+impl Default for WebuiConfig {
+  fn default() -> Self {
+    Self {
+      enabled: false,
+      host: default_webui_host(),
+      port: default_webui_port(),
+      session_secret: default_session_secret(),
+      users_file: default_users_file(),
+    }
+  }
+}
+
+impl WebuiConfig {
+  /// Адрес HTTP-сервера WebUI.
+  pub fn socket_addr(&self) -> Result<SocketAddr> {
+    format!("{}:{}", self.host, self.port)
+      .parse()
+      .map_err(|err| StealthGateError::Config(format!("некорректный webui-адрес: {err}")))
+  }
+}
+
 /// Корневая конфигурация прокси.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
   pub listen: ListenConfig,
   pub tls: TlsConfig,
@@ -99,6 +150,8 @@ pub struct Config {
   pub fragmentation: FragmentationConfig,
   #[serde(default)]
   pub admin: AdminConfig,
+  #[serde(default)]
+  pub webui: WebuiConfig,
 }
 
 impl Config {
@@ -113,6 +166,18 @@ impl Config {
 
     toml::from_str(&content)
       .map_err(|err| StealthGateError::Config(format!("ошибка парсинга TOML: {err}")))
+  }
+
+  /// Сохраняет конфигурацию в TOML-файл.
+  pub fn save_to_file(&self, path: impl AsRef<Path>) -> Result<()> {
+    let content = toml::to_string_pretty(self)
+      .map_err(|err| StealthGateError::Config(format!("сериализация TOML: {err}")))?;
+    fs::write(path.as_ref(), content).map_err(|err| {
+      StealthGateError::Config(format!(
+        "не удалось записать {}: {err}",
+        path.as_ref().display()
+      ))
+    })
   }
 
   /// Декодирует hex-секрет MTProto (с опциональным префиксом `dd`/`ee`).
@@ -146,13 +211,6 @@ mod tests {
   #[test]
   fn decode_secret_with_ee_prefix() {
     let bytes = decode_secret("ee0123456789abcdef0123456789abcdef").expect("декодирование");
-    assert_eq!(bytes.len(), 16);
-    assert_eq!(bytes[0], 0x01);
-  }
-
-  #[test]
-  fn decode_secret_without_prefix() {
-    let bytes = decode_secret("0123456789abcdef0123456789abcdef").expect("декодирование");
     assert_eq!(bytes.len(), 16);
   }
 

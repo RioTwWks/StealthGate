@@ -6,14 +6,12 @@ port = 443
 cert_file = "certs/cert.pem"
 key_file = "certs/key.pem"
 fake_domain = "www.cloudflare.com"
-# ja4_profile = "t0303d"
 
 [mtproto]
 secret = "ee0123456789abcdef0123456789abcdef"
 backend = "149.154.167.99:443"
 
 [fallback]
-# upstream = "127.0.0.1:8080"
 static_html = "web/index.html"
 
 [fragmentation]
@@ -23,3 +21,10 @@ delay_ms = 0
 
 [admin]
 socket = "/tmp/stealth-gate.sock"
+
+[webui]
+enabled = true
+host = "127.0.0.1"
+port = 8088
+session_secret = "change-me-in-production"
+users_file = "data/users.json"

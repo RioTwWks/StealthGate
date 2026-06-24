@@ -18,10 +18,15 @@ fmt:
 run: build
     ./target/release/stealth-gate --config configs/config.toml
 
-# MCP-сервер управления
+# MCP stdio transport
 mcp:
     cargo build --release --bin stealth-gate-mcp
     ./target/release/stealth-gate-mcp --config configs/config.toml
+
+# MCP streamable HTTP transport
+mcp-http:
+    cargo build --release --bin stealth-gate-mcp
+    ./target/release/stealth-gate-mcp --transport http --http-port 8090 --config configs/config.toml
 
 # Генерация TLS-сертификатов
 certs:

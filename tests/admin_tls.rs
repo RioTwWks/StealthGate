@@ -6,13 +6,14 @@ use std::time::Duration;
 use stealth_gate::admin;
 use stealth_gate::config::{
   AdminConfig, FallbackConfig, FragmentationConfig, ListenConfig, MtprotoConfig, TlsConfig,
+  WebuiConfig,
 };
 use stealth_gate::state::AppState;
 use stealth_gate::tls_server;
 use stealth_gate::Config;
 use tempfile::tempdir;
 
-fn sample_config() -> Config {
+fn sample_config(users_file: &str) -> Config {
   Config {
     listen: ListenConfig {
       host: "127.0.0.1".into(),
@@ -34,6 +35,10 @@ fn sample_config() -> Config {
     },
     fragmentation: FragmentationConfig::default(),
     admin: AdminConfig::default(),
+    webui: WebuiConfig {
+      users_file: users_file.into(),
+      ..Default::default()
+    },
   }
 }
 
@@ -42,12 +47,13 @@ async fn admin_socket_stats_and_reload() {
   let dir = tempdir().expect("tempdir");
   let socket_path = dir.path().join("admin.sock");
   let config_path = dir.path().join("config.toml");
-  std::fs::write(&config_path, include_str!("../configs/config.toml")).expect("write config");
+  let users_file = dir.path().join("users.json").to_string_lossy().to_string();
 
-  let mut config = sample_config();
+  let mut config = sample_config(&users_file);
   config.admin.socket = Some(socket_path.to_string_lossy().to_string());
+  config.save_to_file(&config_path).expect("save");
 
-  let state = AppState::new(config, config_path.to_string_lossy());
+  let state = AppState::new(config, config_path.to_string_lossy()).expect("state");
   let socket = socket_path.to_string_lossy().to_string();
 
   let admin_task = {
