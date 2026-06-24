@@ -17,12 +17,12 @@ use crate::error::{Result, StealthGateError};
 use crate::state::AppState;
 use crate::web::api;
 
-/// Запускает WebUI HTTP-сервер.
-pub async fn run_webui(state: Arc<AppState>, config: WebuiConfig) -> Result<()> {
-  let addr: SocketAddr = config.socket_addr()?;
+/// Собирает Axum-приложение WebUI (используется в тестах и `run_webui`).
+pub fn build_webui_app(state: Arc<AppState>, session_secret: &str) -> Router {
   let session_key = {
-    let digest = sha2::Sha256::digest(config.session_secret.as_bytes());
-    Key::from(&digest)
+    // Key::from требует 64 байта — используем SHA-512 от секрета.
+    let digest = sha2::Sha512::digest(session_secret.as_bytes());
+    Key::from(digest.as_slice())
   };
   let session_layer = SessionManagerLayer::new(MemoryStore::default())
     .with_secure(false)
@@ -30,12 +30,18 @@ pub async fn run_webui(state: Arc<AppState>, config: WebuiConfig) -> Result<()> 
     .with_name("stealthgate_session")
     .with_signed(session_key);
 
-  let app = Router::new()
+  Router::new()
     .route("/", get(|| async { Redirect::to("/ui/login.html") }))
-    .nest("/api", api::router(Arc::clone(&state)))
+    .nest("/api", api::router(state))
     .nest_service("/ui", ServeDir::new("web/dashboard"))
     .layer(session_layer)
-    .layer(TraceLayer::new_for_http());
+    .layer(TraceLayer::new_for_http())
+}
+
+/// Запускает WebUI HTTP-сервер.
+pub async fn run_webui(state: Arc<AppState>, config: WebuiConfig) -> Result<()> {
+  let addr: SocketAddr = config.socket_addr()?;
+  let app = build_webui_app(Arc::clone(&state), &config.session_secret);
 
   let listener = tokio::net::TcpListener::bind(addr)
     .await

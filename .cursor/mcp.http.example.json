@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "stealth-gate-http": {
+      "url": "http://127.0.0.1:8090/mcp",
+      "description": "MCP streamable HTTP (сначала: just mcp-http)"
+    }
+  }
+}
