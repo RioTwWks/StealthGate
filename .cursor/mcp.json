@@ -37,7 +37,7 @@
     },
     "sery": {
       "command": "sery-mcp",
-      "args": ["--root", "/Users/ваше-имя/Documents"]
+      "args": ["--root", "/Users/ivan/Documents"]
     },
     "tool42": {
       "command": "tool42"
