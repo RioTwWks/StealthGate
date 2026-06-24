@@ -118,13 +118,15 @@ users_file = "data/users.json"
 | `operator` | настройки прокси, статистика |
 | `viewer` | только просмотр статистики |
 
-REST API (`/api/v1/*`):
+REST API (`/api/*`):
 
 - `POST /auth/login`, `POST /auth/logout`, `GET /auth/me`
 - `GET /stats`, `GET /config`, `POST /config/reload`
 - `PUT /config/mtproto` — secret, backend, fake_domain
 - `PUT /config/fragmentation` — enabled, chunk_sizes, delay_ms
 - `GET/POST /users`, `DELETE /users/{username}`, `PUT /users/{username}/password`
+
+Подробнее: [docs/WEBUI.md](docs/WEBUI.md).
 
 Статика дашборда: `web/dashboard/` (`login.html`, `dashboard.html`, `users.html`).
 
@@ -139,40 +141,20 @@ tg://proxy?server=YOUR_IP&port=443&secret=ee0123456789...
 ## 🧪 Тестирование
 
 ```bash
-cargo test          # unit-тесты
-cargo test -- --ignored  # интеграционные тесты
+cargo test                    # все тесты
+cargo test --test webui       # WebUI: login + API
+cargo test --test tls_handshake
+cargo test --test mcp_http
+cargo test -- --ignored       # сетевые интеграционные
 ```
 
 ## 🧩 MCP-интеграция
 
 Бинарник `stealth-gate-mcp` предоставляет инструменты: `get_stats`, `get_config`, `reload_config`, `update_secret`.
 
-**stdio** (Cursor):
+Подробнее: [docs/MCP.md](docs/MCP.md), настройка Cursor: [docs/CURSOR.md](docs/CURSOR.md).
 
-```json
-{
-  "mcpServers": {
-    "stealth-gate": {
-      "command": "/path/to/stealth-gate-mcp",
-      "args": ["--config", "/path/to/config.toml"]
-    }
-  }
-}
-```
-
-**streamable HTTP** (`POST /mcp` на порту 8090):
-
-```json
-{
-  "mcpServers": {
-    "stealth-gate": {
-      "url": "http://127.0.0.1:8090/mcp"
-    }
-  }
-}
-```
-
-MCP работает напрямую с `AppState` прокси (без Unix-сокета), если оба процесса используют один конфиг.
+Готовый конфиг MCP для проекта: [`.cursor/mcp.json`](.cursor/mcp.json).
 
 ## 📄 Лицензия
 

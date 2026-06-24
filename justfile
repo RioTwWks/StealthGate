@@ -6,6 +6,10 @@ build:
 test:
     cargo test -- --nocapture
 
+# Только WebUI-интеграция
+test-webui:
+    cargo test --test webui -- --nocapture
+
 # Запуск линтера
 lint:
     cargo clippy -- -D warnings
