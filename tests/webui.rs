@@ -228,3 +228,83 @@ async fn webui_serves_dashboard_static() {
 
   ct.cancel();
 }
+
+#[tokio::test]
+async fn webui_proxy_link_qr_requires_auth_and_returns_svg() {
+  let dir = tempdir().expect("tempdir");
+  let users_file = dir.path().join("users.json").to_string_lossy().to_string();
+  let config_path = dir.path().join("config.toml");
+  let config = sample_config(&users_file);
+  config.save_to_file(&config_path).expect("save config");
+
+  let state = AppState::new(config, config_path.to_string_lossy()).expect("state");
+  let (base_url, ct) = spawn_webui_test_server(state).await;
+  let client = http_client();
+
+  let unauth = client
+    .get(format!("{base_url}/api/proxy-link/qr"))
+    .send()
+    .await
+    .expect("qr unauth");
+  assert_eq!(unauth.status(), 401);
+
+  let login = client
+    .post(format!("{base_url}/api/auth/login"))
+    .json(&serde_json::json!({
+      "username": "admin",
+      "password": ADMIN_PASSWORD
+    }))
+    .send()
+    .await
+    .expect("login");
+  let session_cookie = session_cookie_header(&login);
+
+  let proxy_link = client
+    .get(format!("{base_url}/api/proxy-link"))
+    .header("cookie", &session_cookie)
+    .send()
+    .await
+    .expect("proxy link");
+  assert_eq!(proxy_link.status(), 200);
+  let link_body: Value = proxy_link.json().await.expect("link json");
+  let link = link_body["link"]
+    .as_str()
+    .expect("link string");
+  assert!(link.starts_with("tg://proxy?"));
+
+  let qr = client
+    .get(format!("{base_url}/api/proxy-link/qr"))
+    .header("cookie", &session_cookie)
+    .send()
+    .await
+    .expect("qr");
+  assert_eq!(qr.status(), 200);
+  let content_type = qr
+    .headers()
+    .get("content-type")
+    .and_then(|value| value.to_str().ok())
+    .unwrap_or_default();
+  assert!(
+    content_type.contains("image/svg+xml"),
+    "ожидался SVG, получен {content_type}"
+  );
+
+  let svg = qr.text().await.expect("svg body");
+  assert!(svg.contains("<svg"), "ответ должен содержать SVG");
+  assert!(
+    svg.contains("viewBox") || svg.contains("width"),
+    "SVG должен содержать размеры"
+  );
+
+  let qr_again = client
+    .get(format!("{base_url}/api/proxy-link/qr"))
+    .header("cookie", &session_cookie)
+    .send()
+    .await
+    .expect("qr again");
+  let svg_again = qr_again.text().await.expect("svg again");
+  assert_eq!(svg, svg_again);
+
+  let _ = link;
+  ct.cancel();
+}

@@ -14,6 +14,10 @@ path = "src/bin/stealth-gate.rs"
 name = "stealth-gate-mcp"
 path = "src/bin/stealth-gate-mcp.rs"
 
+[[example]]
+name = "webhook-receiver"
+path = "examples/webhook_receiver.rs"
+
 [lib]
 name = "stealth_gate"
 path = "src/lib.rs"
