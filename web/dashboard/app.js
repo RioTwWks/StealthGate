@@ -227,6 +227,42 @@ async function initDashboardPage() {
 
   if (summary) {
     document.title = `StealthGate — ${summary.listen}`;
+    if (summary.uninstall_enabled) {
+      document.getElementById('uninstall-panel')?.classList.remove('hidden');
+    }
+  }
+
+  const uninstallForm = document.getElementById('uninstall-form');
+  if (uninstallForm && user.role === 'admin') {
+    uninstallForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const form = event.target;
+      const purge = form.purge.checked;
+      const confirmText = form.confirm.value.trim();
+      if (confirmText !== 'UNINSTALL') {
+        showMessage('dashboard-message', 'Введи UNINSTALL для подтверждения', true);
+        return;
+      }
+      const warning = purge
+        ? 'Удалить сервис и ВСЕ данные? Это необратимо.'
+        : 'Удалить systemd-сервис StealthGate?';
+      if (!window.confirm(warning)) {
+        return;
+      }
+      try {
+        await api('/system/uninstall', {
+          method: 'POST',
+          body: JSON.stringify({ confirm: 'UNINSTALL', purge }),
+        });
+        showMessage(
+          'dashboard-message',
+          'Удаление запущено. Сервис остановится через несколько секунд.',
+        );
+        form.reset();
+      } catch (err) {
+        showMessage('dashboard-message', err.message, true);
+      }
+    });
   }
 }
 

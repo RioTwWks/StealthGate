@@ -10,6 +10,7 @@ use tower_sessions::Session;
 
 use crate::config::FragmentationConfig;
 use crate::state::{AppState, SessionUser, StatsSnapshot};
+use crate::system_ops::{schedule_uninstall, UninstallSettings, UNINSTALL_CONFIRM_PHRASE};
 use crate::web::session::{
   parse_role, require_admin, require_editor, require_user, ApiError,
 };
@@ -45,6 +46,13 @@ pub struct UpdatePasswordRequest {
   pub password: String,
 }
 
+#[derive(Deserialize)]
+pub struct UninstallRequest {
+  pub confirm: String,
+  #[serde(default)]
+  pub purge: bool,
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
   Router::new()
     .route("/auth/login", post(login))
@@ -62,6 +70,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     .route("/users", get(list_users).post(create_user))
     .route("/users/{username}", delete(delete_user))
     .route("/users/{username}/password", put(update_password))
+    .route("/system/uninstall", post(uninstall_service))
     .with_state(state)
 }
 
@@ -270,4 +279,36 @@ async fn api_metrics(
     [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
     crate::metrics::render_prometheus(&state),
   ))
+}
+
+async fn uninstall_service(
+  State(state): State<Arc<AppState>>,
+  session: Session,
+  Json(payload): Json<UninstallRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+  let user = require_user(session).await?;
+  require_admin(&user)?;
+
+  if payload.confirm != UNINSTALL_CONFIRM_PHRASE {
+    return Err(ApiError::bad_request(format!(
+      "для подтверждения введи {UNINSTALL_CONFIRM_PHRASE}"
+    )));
+  }
+
+  let settings = {
+    let config = state
+      .full_config()
+      .map_err(ApiError::from_stealth_gate)?;
+    UninstallSettings::from_config(&config)
+  };
+
+  schedule_uninstall(&settings, payload.purge)
+    .await
+    .map_err(ApiError::from_stealth_gate)?;
+
+  Ok(Json(serde_json::json!({
+    "status": "uninstall_scheduled",
+    "purge": payload.purge,
+    "message": "Сервис будет остановлен и удалён. Соединение с WebUI может оборваться."
+  })))
 }

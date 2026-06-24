@@ -25,6 +25,8 @@
 | Config validate | ✅ | при load/save |
 | CI GitHub Actions | ✅ | `.github/workflows/ci.yml` |
 | systemd unit | ✅ | `deploy/stealth-gate.service` |
+| install / uninstall scripts | ✅ | `deploy/install.sh`, `deploy/uninstall.sh` |
+| WebUI удаление сервиса | ✅ | кнопка admin + `POST /api/system/uninstall` |
 | Multi-backend failover | ✅ | `mtproto.backends`, `failover_strategy` |
 
 ## Phase 3 — Differentiation
