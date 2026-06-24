@@ -17,6 +17,7 @@ pub mod metrics;
 pub mod network;
 pub mod proxy;
 pub mod state;
+pub mod system_ops;
 pub mod tls;
 pub mod tls_server;
 pub mod users;

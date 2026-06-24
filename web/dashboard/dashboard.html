@@ -90,6 +90,26 @@
         </form>
       </section>
 
+      <section class="panel danger-panel hidden" id="uninstall-panel" data-role="admin">
+        <h2>Удаление сервиса</h2>
+        <p class="muted">
+          Остановит systemd-сервис и удалит unit. Опционально — все файлы и конфигурацию.
+        </p>
+        <form id="uninstall-form" class="form-grid">
+          <label class="checkbox">
+            <input type="checkbox" name="purge">
+            Полное удаление (--purge): /opt/stealth-gate, /etc/stealth-gate, пользователь
+          </label>
+          <label>
+            Подтверждение: введи <code>UNINSTALL</code>
+            <input type="text" name="confirm" autocomplete="off" placeholder="UNINSTALL">
+          </label>
+          <div class="form-actions">
+            <button type="submit" class="btn danger">Удалить сервис</button>
+          </div>
+        </form>
+      </section>
+
       <p id="dashboard-message" class="message hidden"></p>
     </main>
   </div>

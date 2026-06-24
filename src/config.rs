@@ -338,10 +338,33 @@ impl Default for MetricsConfig {
   }
 }
 
-/// Admin API через Unix-сокет.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Admin API через Unix-сокет и управление сервисом.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminConfig {
   pub socket: Option<String>,
+  /// Разрешить удаление systemd-сервиса из WebUI.
+  #[serde(default)]
+  pub uninstall_enabled: bool,
+  /// Путь к скрипту uninstall (по умолчанию /opt/stealth-gate/bin/uninstall).
+  pub uninstall_script: Option<String>,
+  /// Вызывать uninstall через sudo (false — для тестов/dev).
+  #[serde(default = "default_uninstall_use_sudo")]
+  pub uninstall_use_sudo: bool,
+}
+
+fn default_uninstall_use_sudo() -> bool {
+  true
+}
+
+impl Default for AdminConfig {
+  fn default() -> Self {
+    Self {
+      socket: None,
+      uninstall_enabled: false,
+      uninstall_script: None,
+      uninstall_use_sudo: default_uninstall_use_sudo(),
+    }
+  }
 }
 
 /// WebUI-дашборд управления.

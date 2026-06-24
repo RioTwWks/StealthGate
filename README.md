@@ -54,6 +54,16 @@ cargo build --release
 
 WebUI: [http://127.0.0.1:8088/ui/login.html](http://127.0.0.1:8088/ui/login.html) (логин по умолчанию `admin` / `admin123`).
 
+### systemd (production)
+
+```bash
+cargo build --release
+sudo bash deploy/install.sh          # установка
+sudo bash deploy/uninstall.sh --purge  # удаление одной командой
+```
+
+Подробнее: [docs/DEPLOY.md](docs/DEPLOY.md) — установка, удаление из CLI и WebUI.
+
 ### MCP-сервер
 
 ```bash

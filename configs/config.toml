@@ -65,6 +65,9 @@ port = 9091
 
 [admin]
 socket = "/tmp/stealth-gate.sock"
+# Включить после deploy/install.sh для кнопки удаления в WebUI
+uninstall_enabled = false
+uninstall_script = "/opt/stealth-gate/bin/uninstall"
 
 [webui]
 enabled = true

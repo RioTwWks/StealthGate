@@ -39,3 +39,11 @@ certs:
 # Очистка
 clean:
     cargo clean
+
+# Установка systemd-сервиса (требует root)
+install-service: build
+    sudo bash deploy/install.sh
+
+# Удаление systemd-сервиса одной командой (требует root)
+uninstall-service:
+    sudo bash deploy/uninstall.sh --purge
