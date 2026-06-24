@@ -38,6 +38,11 @@ pub async fn handle_fallback(
   serve_static_html(client, initial_data, config.static_html.as_deref()).await
 }
 
+/// Возвращает HTML-контент для заглушки.
+pub fn resolve_html_content(static_html: Option<&str>) -> String {
+  resolve_html(static_html)
+}
+
 async fn serve_static_html(
   mut client: TcpStream,
   initial_data: &[u8],

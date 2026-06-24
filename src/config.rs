@@ -22,12 +22,25 @@ impl ListenConfig {
   }
 }
 
-/// TLS-настройки для маскировки.
+/// TLS-настройки для маскировки и терминации.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TlsConfig {
   pub cert_file: Option<String>,
   pub key_file: Option<String>,
   pub fake_domain: String,
+  /// Ожидаемый JA4-профиль для логирования/валидации (опционально).
+  pub ja4_profile: Option<String>,
+}
+
+impl TlsConfig {
+  /// TLS-терминация доступна, если заданы оба PEM-файла.
+  pub fn is_enabled(&self) -> bool {
+    self
+      .cert_file
+      .as_ref()
+      .zip(self.key_file.as_ref())
+      .is_some_and(|(cert, key)| Path::new(cert).exists() && Path::new(key).exists())
+  }
 }
 
 /// MTProto-настройки.
@@ -44,6 +57,37 @@ pub struct FallbackConfig {
   pub static_html: Option<String>,
 }
 
+/// Динамическая фрагментация начального пакета.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FragmentationConfig {
+  #[serde(default)]
+  pub enabled: bool,
+  #[serde(default = "default_chunk_sizes")]
+  pub chunk_sizes: Vec<usize>,
+  #[serde(default)]
+  pub delay_ms: u64,
+}
+
+fn default_chunk_sizes() -> Vec<usize> {
+  vec![1, 2, 1]
+}
+
+impl Default for FragmentationConfig {
+  fn default() -> Self {
+    Self {
+      enabled: false,
+      chunk_sizes: default_chunk_sizes(),
+      delay_ms: 0,
+    }
+  }
+}
+
+/// Admin API через Unix-сокет.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct AdminConfig {
+  pub socket: Option<String>,
+}
+
 /// Корневая конфигурация прокси.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -51,6 +95,10 @@ pub struct Config {
   pub tls: TlsConfig,
   pub mtproto: MtprotoConfig,
   pub fallback: FallbackConfig,
+  #[serde(default)]
+  pub fragmentation: FragmentationConfig,
+  #[serde(default)]
+  pub admin: AdminConfig,
 }
 
 impl Config {
@@ -106,5 +154,12 @@ mod tests {
   fn decode_secret_without_prefix() {
     let bytes = decode_secret("0123456789abcdef0123456789abcdef").expect("декодирование");
     assert_eq!(bytes.len(), 16);
+  }
+
+  #[test]
+  fn fragmentation_defaults() {
+    let config: FragmentationConfig = toml::from_str("").expect("default");
+    assert!(!config.enabled);
+    assert_eq!(config.chunk_sizes, vec![1, 2, 1]);
   }
 }

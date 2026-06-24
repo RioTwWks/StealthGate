@@ -1,25 +1,37 @@
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
+use crate::config::FragmentationConfig;
 use crate::error::{Result, StealthGateError};
+use crate::fragmentation;
+use crate::state::Stats;
 
 /// Проксирует MTProto-трафик на backend Telegram.
 pub async fn proxy_mtproto(
   client: TcpStream,
   initial_data: &[u8],
   backend: &str,
+  frag_config: &FragmentationConfig,
+  stats: &Stats,
 ) -> Result<()> {
   let mut upstream = TcpStream::connect(backend)
     .await
     .map_err(|err| StealthGateError::Proxy(format!("подключение к {backend}: {err}")))?;
 
-  upstream
-    .write_all(initial_data)
-    .await
-    .map_err(|err| StealthGateError::Proxy(format!("запись в backend: {err}")))?;
+  fragmentation::write_to_backend(&mut upstream, initial_data, frag_config, stats).await?;
+  stats
+    .bytes_to_backend
+    .fetch_add(initial_data.len() as u64, std::sync::atomic::Ordering::Relaxed);
 
   let (client_to_upstream, upstream_to_client) =
     copy_bidirectional(client, upstream).await?;
+
+  stats
+    .bytes_to_backend
+    .fetch_add(client_to_upstream, std::sync::atomic::Ordering::Relaxed);
+  stats
+    .bytes_from_backend
+    .fetch_add(upstream_to_client, std::sync::atomic::Ordering::Relaxed);
 
   tracing::debug!(
     client_to_upstream,

@@ -1,0 +1,87 @@
+//! Тесты admin API и TLS.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use stealth_gate::admin;
+use stealth_gate::config::{
+  AdminConfig, FallbackConfig, FragmentationConfig, ListenConfig, MtprotoConfig, TlsConfig,
+};
+use stealth_gate::state::AppState;
+use stealth_gate::tls_server;
+use stealth_gate::Config;
+use tempfile::tempdir;
+
+fn sample_config() -> Config {
+  Config {
+    listen: ListenConfig {
+      host: "127.0.0.1".into(),
+      port: 8443,
+    },
+    tls: TlsConfig {
+      cert_file: Some("certs/cert.pem".into()),
+      key_file: Some("certs/key.pem".into()),
+      fake_domain: "www.cloudflare.com".into(),
+      ja4_profile: None,
+    },
+    mtproto: MtprotoConfig {
+      secret: "0123456789abcdef0123456789abcdef".into(),
+      backend: "127.0.0.1:443".into(),
+    },
+    fallback: FallbackConfig {
+      upstream: None,
+      static_html: None,
+    },
+    fragmentation: FragmentationConfig::default(),
+    admin: AdminConfig::default(),
+  }
+}
+
+#[tokio::test]
+async fn admin_socket_stats_and_reload() {
+  let dir = tempdir().expect("tempdir");
+  let socket_path = dir.path().join("admin.sock");
+  let config_path = dir.path().join("config.toml");
+  std::fs::write(&config_path, include_str!("../configs/config.toml")).expect("write config");
+
+  let mut config = sample_config();
+  config.admin.socket = Some(socket_path.to_string_lossy().to_string());
+
+  let state = AppState::new(config, config_path.to_string_lossy());
+  let socket = socket_path.to_string_lossy().to_string();
+
+  let admin_task = {
+    let state = Arc::clone(&state);
+    let socket = socket.clone();
+    tokio::spawn(async move { admin::run_admin_socket(state, &socket).await })
+  };
+
+  tokio::time::sleep(Duration::from_millis(50)).await;
+
+  let stats = admin::admin_request(&socket, "GET", "/stats", None)
+    .await
+    .expect("stats");
+  assert!(stats.contains("total_connections"));
+
+  let reload = admin::admin_request(&socket, "POST", "/reload", None)
+    .await
+    .expect("reload");
+  assert!(reload.contains("reloaded"));
+
+  admin_task.abort();
+}
+
+#[test]
+fn tls_server_loads_generated_cert() {
+  if !std::path::Path::new("certs/cert.pem").exists() {
+    return;
+  }
+  let tls = TlsConfig {
+    cert_file: Some("certs/cert.pem".into()),
+    key_file: Some("certs/key.pem".into()),
+    fake_domain: "www.cloudflare.com".into(),
+    ja4_profile: None,
+  };
+  assert!(tls.is_enabled());
+  tls_server::load_server_config(&tls).expect("load tls config");
+}

@@ -18,6 +18,15 @@ fmt:
 run: build
     ./target/release/stealth-gate --config configs/config.toml
 
+# MCP-сервер управления
+mcp:
+    cargo build --release --bin stealth-gate-mcp
+    ./target/release/stealth-gate-mcp --config configs/config.toml
+
+# Генерация TLS-сертификатов
+certs:
+    bash scripts/gen-cert.sh
+
 # Очистка
 clean:
     cargo clean

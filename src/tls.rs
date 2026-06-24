@@ -281,6 +281,48 @@ pub fn looks_like_tls_client_hello(data: &[u8]) -> bool {
   matches!(HandshakeType::from_byte(record.payload[0]), HandshakeType::ClientHello)
 }
 
+/// Вычисляет JA4-подобный фингерпринт ClientHello для эмуляции/логирования.
+pub fn compute_ja4(hello: &ClientHello<'_>) -> String {
+  use sha2::{Digest, Sha256};
+
+  let version = format!("{:02x}{:02x}", hello.client_version[0], hello.client_version[1]);
+  let sni_marker = if hello.sni.is_some() { 'd' } else { 'i' };
+  let cipher_count = (hello.cipher_suites.len() / 2).min(99);
+  let ext_count = count_extensions(hello.extensions).min(99);
+
+  let mut cipher_hasher = Sha256::new();
+  cipher_hasher.update(hello.cipher_suites);
+  let cipher_hash = hex::encode(&cipher_hasher.finalize()[..6]);
+
+  let mut ext_hasher = Sha256::new();
+  ext_hasher.update(hello.extensions);
+  let ext_hash = hex::encode(&ext_hasher.finalize()[..6]);
+
+  format!(
+    "t{version}{sni_marker}{cipher_count:02}{ext_count:02}_{cipher_hash}_{ext_hash}"
+  )
+}
+
+fn count_extensions(extensions: &[u8]) -> usize {
+  let mut offset = 0usize;
+  let mut count = 0usize;
+  while offset + 4 <= extensions.len() {
+    let ext_len = u16::from_be_bytes([extensions[offset + 2], extensions[offset + 3]]) as usize;
+    offset += 4;
+    if offset + ext_len > extensions.len() {
+      break;
+    }
+    offset += ext_len;
+    count += 1;
+  }
+  count
+}
+
+/// Проверяет соответствие JA4 ожидаемому профилю (префикс или полное совпадение).
+pub fn ja4_matches(fingerprint: &str, profile: &str) -> bool {
+  fingerprint == profile || fingerprint.starts_with(profile)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -332,5 +374,8 @@ mod tests {
     let hello = parse_client_hello(record.payload).expect("client hello");
     assert_eq!(hello.sni.as_deref(), Some("www.cloudflare.com"));
     assert!(looks_like_tls_client_hello(&data));
+    let ja4 = compute_ja4(&hello);
+    assert!(ja4.starts_with('t'));
+    assert!(ja4.contains('_'));
   }
 }
