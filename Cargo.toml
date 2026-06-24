@@ -1,0 +1,33 @@
+[package]
+name = "stealth-gate"
+version = "0.1.0"
+edition = "2021"
+description = "Fake TLS MTProto-прокси на Rust"
+license = "MIT"
+readme = "README.md"
+
+[[bin]]
+name = "stealth-gate"
+path = "src/bin/stealth-gate.rs"
+
+[lib]
+name = "stealth_gate"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

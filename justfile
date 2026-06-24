@@ -16,7 +16,7 @@ fmt:
 
 # Запуск с конфигом
 run: build
-    ./target/release/telegram-proxy --config configs/config.toml
+    ./target/release/stealth-gate --config configs/config.toml
 
 # Очистка
 clean:
