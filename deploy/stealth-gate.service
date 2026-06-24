@@ -1,0 +1,26 @@
+[Unit]
+Description=StealthGate MTProto proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=stealthgate
+Group=stealthgate
+WorkingDirectory=/opt/stealth-gate
+ExecStart=/opt/stealth-gate/bin/stealth-gate --config /etc/stealth-gate/config.toml
+Restart=on-failure
+RestartSec=3
+Environment=RUST_LOG=info
+# Пароль первого admin WebUI (опционально)
+# Environment=STEALTHGATE_ADMIN_PASSWORD=...
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/stealth-gate/data /tmp
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

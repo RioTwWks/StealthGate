@@ -8,36 +8,10 @@ use rmcp::transport::streamable_http_server::{
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
 
-use stealth_gate::config::WebuiConfig;
 use stealth_gate::{AppState, Config, StealthGateMcp};
 
 fn sample_config(users_file: &str) -> Config {
-  Config {
-    listen: stealth_gate::config::ListenConfig {
-      host: "127.0.0.1".into(),
-      port: 8443,
-    },
-    tls: stealth_gate::config::TlsConfig {
-      cert_file: None,
-      key_file: None,
-      fake_domain: "example.com".into(),
-      ja4_profile: None,
-    },
-    mtproto: stealth_gate::config::MtprotoConfig {
-      secret: "0123456789abcdef0123456789abcdef".into(),
-      backend: "127.0.0.1:443".into(),
-    },
-    fallback: stealth_gate::config::FallbackConfig {
-      upstream: None,
-      static_html: None,
-    },
-    fragmentation: stealth_gate::config::FragmentationConfig::default(),
-    admin: stealth_gate::config::AdminConfig::default(),
-    webui: WebuiConfig {
-      users_file: users_file.into(),
-      ..Default::default()
-    },
-  }
+  Config::test_minimal(users_file)
 }
 
 #[tokio::test]

@@ -9,7 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-use stealth_gate::config::{FallbackConfig, WebuiConfig};
+use stealth_gate::config::FallbackConfig;
 use stealth_gate::tls_server;
 use stealth_gate::Config;
 
@@ -53,31 +53,18 @@ async fn full_tls_handshake_serves_html() {
 
   let (cert_file, key_file, cert_chain, key_der) = write_generated_cert(&dir);
 
-  let config = Config {
-    listen: stealth_gate::config::ListenConfig {
-      host: "127.0.0.1".into(),
-      port: 0,
-    },
-    tls: stealth_gate::config::TlsConfig {
-      cert_file: Some(cert_file),
-      key_file: Some(key_file),
-      fake_domain: "localhost".into(),
-      ja4_profile: None,
-    },
-    mtproto: stealth_gate::config::MtprotoConfig {
-      secret: "0123456789abcdef0123456789abcdef".into(),
-      backend: "127.0.0.1:1".into(),
-    },
-    fallback: FallbackConfig {
-      upstream: None,
-      static_html: None,
-    },
-    fragmentation: stealth_gate::config::FragmentationConfig::default(),
-    admin: stealth_gate::config::AdminConfig::default(),
-    webui: WebuiConfig {
-      users_file: users_file.to_string_lossy().to_string(),
-      ..Default::default()
-    },
+  let mut config = Config::test_minimal(users_file.to_string_lossy());
+  config.listen.port = 0;
+  config.tls.cert_file = Some(cert_file);
+  config.tls.key_file = Some(key_file);
+  config.tls.fake_domain = "localhost".into();
+  config.mtproto.backend = "127.0.0.1:1".into();
+  config.fallback = FallbackConfig {
+    upstream: None,
+    static_html: None,
+    domain_fronting: stealth_gate::config::DomainFrontingMode::None,
+    fronting_host: None,
+    fronting_port: 443,
   };
   config.save_to_file(&config_path).expect("save config");
 

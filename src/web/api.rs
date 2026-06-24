@@ -56,6 +56,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     .route("/config/reload", post(reload_config))
     .route("/config/mtproto", put(update_proxy_settings))
     .route("/config/fragmentation", put(update_fragmentation))
+    .route("/proxy-link", get(proxy_link))
+    .route("/metrics", get(api_metrics))
     .route("/users", get(list_users).post(create_user))
     .route("/users/{username}", delete(delete_user))
     .route("/users/{username}/password", put(update_password))
@@ -223,4 +225,24 @@ async fn update_password(
     .update_password(&username, &payload.password)
     .map_err(ApiError::from_stealth_gate)?;
   Ok(StatusCode::NO_CONTENT)
+}
+
+async fn proxy_link(
+  State(state): State<Arc<AppState>>,
+  session: Session,
+) -> Result<impl IntoResponse, ApiError> {
+  require_user(session).await?;
+  let link = state.proxy_link().map_err(ApiError::from_stealth_gate)?;
+  Ok(Json(serde_json::json!({ "link": link })))
+}
+
+async fn api_metrics(
+  State(state): State<Arc<AppState>>,
+  session: Session,
+) -> Result<impl IntoResponse, ApiError> {
+  require_user(session).await?;
+  Ok((
+    [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+    crate::metrics::render_prometheus(&state),
+  ))
 }

@@ -12,32 +12,10 @@ use tokio::net::TcpListener;
 use tokio::time::timeout;
 
 fn test_config() -> Arc<Config> {
-  Arc::new(Config {
-    listen: stealth_gate::config::ListenConfig {
-      host: "127.0.0.1".into(),
-      port: 0,
-    },
-    tls: stealth_gate::config::TlsConfig {
-      cert_file: None,
-      key_file: None,
-      fake_domain: "www.cloudflare.com".into(),
-      ja4_profile: None,
-    },
-    mtproto: stealth_gate::config::MtprotoConfig {
-      secret: "ee0123456789abcdef0123456789abcdef".into(),
-      backend: "127.0.0.1:1".into(),
-    },
-    fallback: stealth_gate::config::FallbackConfig {
-      upstream: None,
-      static_html: None,
-    },
-    fragmentation: stealth_gate::config::FragmentationConfig::default(),
-    admin: stealth_gate::config::AdminConfig::default(),
-    webui: stealth_gate::config::WebuiConfig {
-      users_file: "data/users.json".into(),
-      ..Default::default()
-    },
-  })
+  let mut config = Config::test_minimal("data/users.json");
+  config.mtproto.secret = "ee0123456789abcdef0123456789abcdef".into();
+  config.mtproto.backend = "127.0.0.1:1".into();
+  Arc::new(config)
 }
 
 #[tokio::test]
@@ -52,7 +30,7 @@ async fn fallback_serves_http_stub() {
     let mut buf = vec![0u8; 1024];
     let n = stream.read(&mut buf).await.expect("read");
     buf.truncate(n);
-    fallback::handle_fallback(stream, &buf, &config.fallback)
+    fallback::handle_fallback(stream, &buf, &config.fallback, None, &stealth_gate::state::Stats::default())
       .await
       .expect("fallback");
   });

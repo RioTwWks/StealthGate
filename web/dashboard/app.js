@@ -81,6 +81,8 @@ function renderStats(stats) {
     ['Всего соединений', stats.total_connections],
     ['MTProto', stats.mtproto_connections],
     ['Fallback', stats.fallback_connections],
+    ['Domain fronted', stats.domain_fronted ?? 0],
+    ['Replay blocked', stats.replay_blocked ?? 0],
     ['TLS handshakes', stats.tls_handshakes],
     ['Фрагментаций', stats.fragmented_writes],
     ['Bytes → backend', stats.bytes_to_backend],
@@ -136,6 +138,18 @@ async function initDashboardPage() {
   ]);
 
   renderStats(stats);
+
+  try {
+    const proxy = await api('/proxy-link');
+    const linkInput = document.getElementById('proxy-link');
+    if (linkInput && proxy?.link) {
+      linkInput.value = proxy.link;
+      document.getElementById('copy-proxy-link')?.addEventListener('click', async () => {
+        await navigator.clipboard.writeText(proxy.link);
+        showMessage('dashboard-message', 'Ссылка скопирована');
+      });
+    }
+  } catch (_) {}
 
   if (full) {
     const mtprotoForm = document.getElementById('mtproto-form');

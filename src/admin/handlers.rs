@@ -3,6 +3,7 @@ use serde_json::Value;
 
 use crate::config::{FragmentationConfig, MtprotoConfig};
 use crate::error::{Result, StealthGateError};
+use crate::metrics::render_prometheus;
 use crate::state::AppState;
 
 /// HTTP-ответ admin API.
@@ -17,6 +18,19 @@ pub struct AdminResponse {
 pub fn handle_admin(method: &str, path: &str, body: Option<&str>, state: &AppState) -> Result<AdminResponse> {
   match (method, path) {
     ("GET", "/stats") => json_response(&state.stats.snapshot()),
+    ("GET", "/health") => Ok(AdminResponse {
+      status: 200,
+      content_type: "text/plain",
+      body: "ok".into(),
+    }),
+    ("GET", "/metrics") => Ok(AdminResponse {
+      status: 200,
+      content_type: "text/plain; version=0.0.4",
+      body: render_prometheus(state),
+    }),
+    ("GET", "/proxy-link") => json_response(&serde_json::json!({
+      "link": state.proxy_link()?
+    })),
     ("GET", "/config") => json_response(&state.config_summary()?),
     ("GET", "/config/full") => json_response(&state.full_config()?),
     ("POST", "/reload") => {
@@ -99,40 +113,11 @@ pub fn to_http_response(response: &AdminResponse) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::config::{
-    AdminConfig, FallbackConfig, FragmentationConfig, ListenConfig, MtprotoConfig, TlsConfig,
-    WebuiConfig,
-  };
-  use crate::Config;
+  use crate::config::Config;
   use tempfile::tempdir;
 
   fn sample_config(users_file: &str) -> Config {
-    Config {
-      listen: ListenConfig {
-        host: "127.0.0.1".into(),
-        port: 8443,
-      },
-      tls: TlsConfig {
-        cert_file: None,
-        key_file: None,
-        fake_domain: "example.com".into(),
-        ja4_profile: None,
-      },
-      mtproto: MtprotoConfig {
-        secret: "0123456789abcdef0123456789abcdef".into(),
-        backend: "127.0.0.1:443".into(),
-      },
-      fallback: FallbackConfig {
-        upstream: None,
-        static_html: None,
-      },
-      fragmentation: FragmentationConfig::default(),
-      admin: AdminConfig::default(),
-      webui: WebuiConfig {
-        users_file: users_file.into(),
-        ..Default::default()
-      },
-    }
+    Config::test_minimal(users_file)
   }
 
   #[test]

@@ -6,18 +6,46 @@ port = 443
 cert_file = "certs/cert.pem"
 key_file = "certs/key.pem"
 fake_domain = "www.cloudflare.com"
+# ja4_profile = "t13d..."
+# ja4_enforce через [security]
 
 [mtproto]
 secret = "ee0123456789abcdef0123456789abcdef"
 backend = "149.154.167.99:443"
 
+# Дополнительные секреты (опционально)
+# [[mtproto.secrets]]
+# label = "friends"
+# secret = "ee0123456789abcdef0123456789abcdef"
+# backend = "149.154.175.50:443"
+# max_connections = 100
+
 [fallback]
 static_html = "web/index.html"
+domain_fronting = "sni"
+fronting_port = 443
+# domain_fronting = "fixed"
+# fronting_host = "www.cloudflare.com"
 
 [fragmentation]
 enabled = true
 chunk_sizes = [1, 2, 3, 2, 1]
 delay_ms = 0
+
+[security]
+antireplay_cache_size = 65536
+ja4_enforce = false
+max_connections_per_ip = 0
+ip_blacklist = []
+
+[network]
+# socks5_proxy = "socks5://127.0.0.1:9050"
+backend_timeout_secs = 30
+
+[metrics]
+enabled = true
+host = "127.0.0.1"
+port = 9091
 
 [admin]
 socket = "/tmp/stealth-gate.sock"
