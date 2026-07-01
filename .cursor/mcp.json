@@ -11,7 +11,7 @@
         "--config",
         "configs/config.toml"
       ],
-      "description": "MCP stdio: статистика, конфиг, reload и смена MTProto secret"
+      "description": "MCP stdio: stats, config, get_proxy_link, reload, update_secret"
     },
     "filesystem": {
       "command": "npx",

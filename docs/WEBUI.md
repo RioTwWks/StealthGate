@@ -1,6 +1,6 @@
 # WebUI — дашборд управления StealthGate
 
-WebUI — встроенный HTTP-интерфейс для мониторинга прокси, изменения настроек MTProto и управления пользователями.
+WebUI — встроенный HTTP-интерфейс для мониторинга прокси, изменения настроек MTProto, управления пользователями и (после deploy) удаления systemd-сервиса.
 
 ## Включение
 
@@ -23,7 +23,7 @@ users_file = "data/users.json"
 
 ## Первый вход
 
-1. Собери и запусти прокси: `cargo run --release --bin stealth-gate -- --config configs/config.toml`
+1. Собери и запусти прокси: `just run` или `cargo run --release --bin stealth-gate -- --config configs/config.toml`
 2. Открой http://127.0.0.1:8088/ui/login.html
 3. Логин по умолчанию: `admin` / `admin123` (или значение `STEALTHGATE_ADMIN_PASSWORD`)
 
@@ -34,16 +34,16 @@ users_file = "data/users.json"
 | URL | Описание |
 |-----|----------|
 | `/ui/login.html` | Вход |
-| `/ui/dashboard.html` | Статистика и настройки прокси |
+| `/ui/dashboard.html` | Статистика, настройки прокси, QR-код, удаление сервиса (admin) |
 | `/ui/users.html` | Управление пользователями (только admin) |
 
 ## Роли
 
-| Роль | Просмотр stats | Редактирование конфига | Управление пользователями |
-|------|----------------|------------------------|---------------------------|
-| `admin` | да | да | да |
-| `operator` | да | да | нет |
-| `viewer` | да | нет | нет |
+| Роль | Просмотр stats | Редактирование конфига | Управление пользователями | Удаление сервиса |
+|------|----------------|------------------------|---------------------------|------------------|
+| `admin` | да | да | да | да (если `admin.uninstall_enabled`) |
+| `operator` | да | да | нет | нет |
+| `viewer` | да | нет | нет | нет |
 
 ## REST API
 
@@ -72,6 +72,37 @@ curl -b cookies.txt -X POST http://127.0.0.1:8088/api/auth/logout
 | `GET` | `/api/config` | любая | Краткая сводка конфигурации |
 | `GET` | `/api/config/full` | operator+ | Полный конфиг |
 | `POST` | `/api/config/reload` | operator+ | Перечитать `config.toml` с диска |
+| `GET` | `/api/metrics` | любая | Prometheus text (для авторизованных) |
+
+#### Поля `/api/stats`
+
+| Поле | Описание |
+|------|----------|
+| `total_connections` | Все соединения |
+| `mtproto_connections` | MTProto-трафик |
+| `fallback_connections` | Fallback (не MTProto) |
+| `bytes_to_backend` / `bytes_from_backend` | Трафик к/от DC |
+| `tls_handshakes` | TLS handshakes fallback |
+| `fragmented_writes` | Записи через fragmentation |
+| `drs_writes` | Dynamic Record Sizing |
+| `dd_writes` | dd-протокол |
+| `backend_failovers` | Переключения backend |
+| `replay_blocked` | Заблокированные replay |
+| `domain_fronted` | Domain fronting |
+| `split_relayed` | SGFB relay (front/back) |
+| `split_auth_failed` | Ошибки auth SGFB |
+
+### Ссылка для Telegram
+
+| Метод | Путь | Роль | Описание |
+|-------|------|------|----------|
+| `GET` | `/api/proxy-link` | любая | JSON `{ "link": "tg://proxy?..." }` |
+| `GET` | `/api/proxy-link/qr` | любая | SVG QR-код ссылки |
+
+```bash
+curl -b cookies.txt http://127.0.0.1:8088/api/proxy-link
+curl -b cookies.txt http://127.0.0.1:8088/api/proxy-link/qr -o proxy-qr.svg
+```
 
 ### Настройки прокси
 
@@ -96,6 +127,25 @@ curl -b cookies.txt -X PUT http://127.0.0.1:8088/api/config/fragmentation \
 | `DELETE` | `/api/users/{username}` | Удалить (нельзя удалить себя) |
 | `PUT` | `/api/users/{username}/password` | Сменить пароль |
 
+### Удаление systemd-сервиса (admin)
+
+Требует `admin.uninstall_enabled = true` (включается `deploy/install.sh`).
+
+| Метод | Путь | Описание |
+|-------|------|----------|
+| `POST` | `/api/system/uninstall` | Запланировать удаление сервиса |
+
+```bash
+curl -b cookies.txt -X POST http://127.0.0.1:8088/api/system/uninstall \
+  -H 'Content-Type: application/json' \
+  -d '{"confirm":"UNINSTALL","purge":true}'
+```
+
+- `confirm` — обязательно строка `UNINSTALL`
+- `purge: true` — полное удаление данных (`/opt/stealth-gate`, конфиг)
+
+Подробнее: [DEPLOY.md](./DEPLOY.md).
+
 ## Безопасность
 
 - Сессии: signed cookies (`stealthgate_session`), срок неактивности 12 часов.
@@ -109,4 +159,7 @@ curl -b cookies.txt -X PUT http://127.0.0.1:8088/api/config/fragmentation \
 
 ```bash
 cargo test --test webui
+# или: just test-webui
 ```
+
+Покрывает login, REST API, proxy-link и QR.

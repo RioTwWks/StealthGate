@@ -8,7 +8,7 @@
 
 | Сервер | Назначение |
 |--------|------------|
-| `stealth-gate` | MCP stdio — статистика, конфиг, reload, смена secret |
+| `stealth-gate` | MCP stdio — stats, config, proxy link, reload, secret |
 | `filesystem` | Чтение файлов проекта |
 | `fetch` | HTTP-запросы к WebUI/MCP API |
 
@@ -69,25 +69,65 @@ just mcp-http
 
 Пример: [`.cursor/mcp.http.example.json`](../.cursor/mcp.http.example.json).
 
+### Инструменты MCP
+
+| Инструмент | Описание |
+|------------|----------|
+| `get_stats` | Снимок счётчиков (включая split, DRS, dd, failover) |
+| `get_config` | Краткая сводка конфигурации |
+| `get_proxy_link` | `tg://proxy?...` ссылка для Telegram |
+| `reload_config` | Перечитать `config.toml` с диска |
+| `update_secret` | Обновить MTProto secret (hex, префикс `ee`/`dd`) |
+
+Подробнее: [MCP.md](./MCP.md).
+
 ## Правила агента
 
-Файл [`.cursor/rules/stealthgate.md`](../.cursor/rules/stealthgate.md) дополняет корневой `.cursorrules` контекстом проекта (модули, тесты, команды).
+| Файл | Назначение |
+|------|------------|
+| [`.cursorrules`](../.cursorrules) | Общие Rust-правила и архитектура проекта |
+| [`.cursor/rules/stealthgate.md`](../.cursor/rules/stealthgate.md) | Модули, тесты, команды just, ссылки на docs |
 
 ## Типичный workflow в Cursor
 
-1. **Сборка:** `just build` или `cargo build --release`
-2. **Сертификаты:** `just certs` (первый запуск)
-3. **Прокси + WebUI:** `just run` → http://127.0.0.1:8088/ui/login.html
-4. **MCP:** включи сервер `stealth-gate` в Cursor Settings → MCP
-5. **Тесты:** `just test` или `cargo test`
+1. **Сертификаты:** `just certs` (первый запуск)
+2. **Сборка:** `just build`
+3. **Monolith:** `just run` → http://127.0.0.1:8088/ui/login.html
+4. **Front/Back split:**
+   ```bash
+   just run-back    # терминал 1 — internal relay
+   just run-front   # терминал 2 — публичный edge
+   just test-split  # проверка SGFB
+   ```
+5. **MCP:** включи сервер `stealth-gate` в Cursor Settings → MCP
+6. **Тесты:** `just test` или выборочно:
+   ```bash
+   just test-webui
+   cargo test --test webhooks
+   cargo test --test split
+   cargo test --test service_uninstall
+   ```
+7. **Deploy:** `just install-service` / `just uninstall-service`
 
 ## Примеры запросов к ассистенту
 
 - «Покажи статистику StealthGate через MCP»
+- «Сгенерируй tg:// ссылку через get_proxy_link»
 - «Перезагрузи конфиг прокси»
 - «Обнови MTProto secret на `ee...`»
-- «Запусти интеграционные тесты WebUI»
+- «Объясни протокол SGFB в split.rs»
+- «Запусти интеграционные тесты WebUI и split»
+
+## Документация проекта
+
+| Документ | Содержание |
+|----------|------------|
+| [WEBUI.md](./WEBUI.md) | REST API, QR, uninstall |
+| [MCP.md](./MCP.md) | транспорты и инструменты |
+| [DEPLOY.md](./DEPLOY.md) | systemd install/uninstall |
+| [SPLIT.md](./SPLIT.md) | Front/Back split (v0.6) |
+| [ROADMAP.md](./ROADMAP.md) | статус фич |
 
 ## Игнорирование файлов
 
-[`.cursorignore`](../.cursorignore) исключает `target/`, сертификаты и секреты из индексации Cursor.
+[`.cursorignore`](../.cursorignore) исключает `target/`, сертификаты (`*.pem`, `*.key`) и `.env` из индексации Cursor.
