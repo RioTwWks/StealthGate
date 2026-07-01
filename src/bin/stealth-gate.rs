@@ -42,6 +42,8 @@ async fn main() -> Result<()> {
       admin_socket = ?cfg.admin.socket,
       webui = cfg.webui.enabled,
       webui_listen = %cfg.webui.socket_addr()?,
+      webhooks = cfg.webhooks.enabled,
+      split = ?cfg.split.mode,
       "запуск StealthGate"
     );
   }

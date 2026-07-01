@@ -338,6 +338,77 @@ impl Default for MetricsConfig {
   }
 }
 
+/// Режим Front/Back split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SplitMode {
+  /// Front + Back в одном процессе (по умолчанию).
+  #[default]
+  Monolith,
+  /// Edge: принимает клиентов, MTProto релеит на back.
+  Front,
+  /// Relay: принимает front, подключается к Telegram DC.
+  Back,
+}
+
+/// Front/Back split topology.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitConfig {
+  #[serde(default)]
+  pub mode: SplitMode,
+  /// Общий секрет между front и back (мин. 16 символов).
+  pub auth_token: Option<String>,
+  /// Front: адреса back-узлов.
+  #[serde(default)]
+  pub back_servers: Vec<String>,
+  /// Back: internal listen host.
+  pub back_listen_host: Option<String>,
+  /// Back: internal listen port.
+  pub back_listen_port: Option<u16>,
+  /// Back: разрешённые IP front-узлов (пусто = все).
+  #[serde(default)]
+  pub front_allowlist: Vec<String>,
+  #[serde(default = "default_split_timeout")]
+  pub connect_timeout_secs: u64,
+}
+
+fn default_split_timeout() -> u64 {
+  10
+}
+
+impl Default for SplitConfig {
+  fn default() -> Self {
+    Self {
+      mode: SplitMode::Monolith,
+      auth_token: None,
+      back_servers: Vec::new(),
+      back_listen_host: None,
+      back_listen_port: None,
+      front_allowlist: Vec::new(),
+      connect_timeout_secs: default_split_timeout(),
+    }
+  }
+}
+
+impl SplitConfig {
+  /// Адрес internal listener для back-режима.
+  pub fn back_socket_addr(&self) -> Result<SocketAddr> {
+    let host = self
+      .back_listen_host
+      .as_deref()
+      .filter(|value| !value.is_empty())
+      .ok_or_else(|| {
+        StealthGateError::Config("split.back_listen_host обязателен в back-режиме".into())
+      })?;
+    let port = self.back_listen_port.ok_or_else(|| {
+      StealthGateError::Config("split.back_listen_port обязателен в back-режиме".into())
+    })?;
+    format!("{host}:{port}")
+      .parse()
+      .map_err(|err| StealthGateError::Config(format!("некорректный split back-адрес: {err}")))
+  }
+}
+
 /// Admin API через Unix-сокет и управление сервисом.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminConfig {
@@ -444,6 +515,8 @@ pub struct Config {
   pub webui: WebuiConfig,
   #[serde(default)]
   pub webhooks: WebhooksConfig,
+  #[serde(default)]
+  pub split: SplitConfig,
 }
 
 impl Config {
@@ -542,6 +615,8 @@ impl Config {
       }
     }
 
+    self.split.validate()?;
+
     Ok(())
   }
 
@@ -584,12 +659,51 @@ impl Config {
         ..Default::default()
       },
       webhooks: WebhooksConfig::default(),
+      split: SplitConfig::default(),
     }
   }
 
   /// Декодирует hex-секрет MTProto (с опциональным префиксом `dd`/`ee`).
   pub fn mtproto_secret_bytes(&self) -> Result<Vec<u8>> {
     decode_secret(&self.mtproto.secret)
+  }
+}
+
+impl SplitConfig {
+  /// Валидирует split-секцию.
+  pub fn validate(&self) -> Result<()> {
+    match self.mode {
+      SplitMode::Monolith => Ok(()),
+      SplitMode::Front => {
+        let token = self.auth_token.as_deref().unwrap_or("").trim();
+        if token.len() < 16 {
+          return Err(StealthGateError::Config(
+            "split.auth_token должен быть не короче 16 символов в front-режиме".into(),
+          ));
+        }
+        if self.back_servers.is_empty() {
+          return Err(StealthGateError::Config(
+            "split.back_servers обязателен в front-режиме".into(),
+          ));
+        }
+        Ok(())
+      }
+      SplitMode::Back => {
+        let token = self.auth_token.as_deref().unwrap_or("").trim();
+        if token.len() < 16 {
+          return Err(StealthGateError::Config(
+            "split.auth_token должен быть не короче 16 символов в back-режиме".into(),
+          ));
+        }
+        self.back_socket_addr()?;
+        for ip in &self.front_allowlist {
+          ip.parse::<std::net::IpAddr>().map_err(|err| {
+            StealthGateError::Config(format!("некорректный IP в front_allowlist: {ip}: {err}"))
+          })?;
+        }
+        Ok(())
+      }
+    }
   }
 }
 
@@ -690,6 +804,7 @@ mod tests {
       admin: AdminConfig::default(),
       webui: WebuiConfig::default(),
       webhooks: WebhooksConfig::default(),
+      split: SplitConfig::default(),
     };
     assert!(config.validate().is_err());
   }

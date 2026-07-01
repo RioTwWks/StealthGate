@@ -88,6 +88,7 @@ function renderStats(stats) {
     ['DRS записей', stats.drs_writes ?? 0],
     ['dd записей', stats.dd_writes ?? 0],
     ['Backend failover', stats.backend_failovers ?? 0],
+    ['Split relay', stats.split_relayed ?? 0],
     ['Bytes → backend', stats.bytes_to_backend],
     ['Bytes ← backend', stats.bytes_from_backend],
   ];

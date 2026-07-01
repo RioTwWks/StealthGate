@@ -9,13 +9,14 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::admin;
 use crate::antireplay::client_hello_fingerprint;
-use crate::config::{Config, SecretMode};
+use crate::config::{Config, SecretMode, SplitMode};
 use crate::detector::{DetectionResult, Detector, TrafficType};
 use crate::domain_fronting::{forward_tcp, resolve_fronting_target};
 use crate::error::{Result, StealthGateError};
 use crate::fallback;
 use crate::metrics;
 use crate::proxy;
+use crate::split;
 use crate::state::AppState;
 use crate::tls::{compute_ja4, ja4_matches, looks_like_tls_client_hello, parse_client_hello, parse_record};
 use crate::tls_server;
@@ -187,7 +188,7 @@ async fn handle_mtproto(
     .secret_mode
     .unwrap_or(SecretMode::Classic);
 
-  let (drs, dd, webhooks) = {
+  let (drs, dd, webhooks, split_cfg) = {
     let config = state
       .config
       .read()
@@ -196,6 +197,7 @@ async fn handle_mtproto(
       config.drs.clone(),
       config.dd.clone(),
       config.webhooks.clone(),
+      config.split.clone(),
     )
   };
 
@@ -204,10 +206,23 @@ async fn handle_mtproto(
     backend = %backend,
     secret = ?detection.secret_label,
     ?secret_mode,
+    split = ?split_cfg.mode,
     fragmented = ctx.fragmentation.enabled,
     drs = drs.enabled,
     "MTProto-соединение"
   );
+
+  if split_cfg.mode == SplitMode::Front {
+    return split::relay_from_front(
+      client,
+      peek_buf,
+      backend,
+      secret_mode,
+      &split_cfg,
+      state,
+    )
+    .await;
+  }
 
   proxy::proxy_mtproto(
     client,
@@ -349,6 +364,24 @@ pub async fn run_acceptor(state: Arc<AppState>) -> Result<()> {
   metrics::spawn_metrics(Arc::clone(&state));
 
   {
+    let split_mode = {
+      let config = state
+        .config
+        .read()
+        .map_err(|_| StealthGateError::Config("блокировка config poisoned".into()))?;
+      config.split.mode
+    };
+    if split_mode == SplitMode::Back {
+      let back_state = Arc::clone(&state);
+      tokio::spawn(async move {
+        if let Err(err) = split::run_back_listener(back_state).await {
+          tracing::error!(error = %err, "split back listener завершился с ошибкой");
+        }
+      });
+    }
+  }
+
+  {
     let webhooks = {
       let config = state
         .config
@@ -387,7 +420,7 @@ pub async fn run_acceptor(state: Arc<AppState>) -> Result<()> {
   Ok(())
 }
 
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
   let ctrl_c = async {
     tokio::signal::ctrl_c()
       .await

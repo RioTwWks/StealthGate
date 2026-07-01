@@ -27,6 +27,8 @@ pub struct Stats {
   pub backend_failovers: AtomicU64,
   pub replay_blocked: AtomicU64,
   pub domain_fronted: AtomicU64,
+  pub split_relayed: AtomicU64,
+  pub split_auth_failed: AtomicU64,
 }
 
 impl Stats {
@@ -45,6 +47,8 @@ impl Stats {
       backend_failovers: self.backend_failovers.load(Ordering::Relaxed),
       replay_blocked: self.replay_blocked.load(Ordering::Relaxed),
       domain_fronted: self.domain_fronted.load(Ordering::Relaxed),
+      split_relayed: self.split_relayed.load(Ordering::Relaxed),
+      split_auth_failed: self.split_auth_failed.load(Ordering::Relaxed),
     }
   }
 }
@@ -64,6 +68,8 @@ pub struct StatsSnapshot {
   pub backend_failovers: u64,
   pub replay_blocked: u64,
   pub domain_fronted: u64,
+  pub split_relayed: u64,
+  pub split_auth_failed: u64,
 }
 
 /// Разделяемое состояние прокси.
@@ -272,6 +278,7 @@ impl AppState {
       socks5_proxy: config.network.socks5_proxy.clone(),
       admin_socket: config.admin.socket.clone(),
       uninstall_enabled: config.admin.uninstall_enabled,
+      split_mode: format!("{:?}", config.split.mode).to_lowercase(),
       webui_enabled: config.webui.enabled,
       webui_listen: format!("{}:{}", config.webui.host, config.webui.port),
       metrics_enabled: config.metrics.enabled,
@@ -309,6 +316,7 @@ pub struct ConfigSummary {
   pub socks5_proxy: Option<String>,
   pub admin_socket: Option<String>,
   pub uninstall_enabled: bool,
+  pub split_mode: String,
   pub webui_enabled: bool,
   pub webui_listen: String,
   pub metrics_enabled: bool,
