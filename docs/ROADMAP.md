@@ -1,6 +1,6 @@
 # Roadmap StealthGate
 
-Статус реализации по фазам (v0.5.0).
+Статус реализации по фазам (v0.6.0).
 
 ## Phase 1 — DPI-устойчивость
 
@@ -40,7 +40,7 @@
 | E2E domain fronting test | ✅ | `tests/domain_fronting.rs` |
 | WebUI QR-код | ✅ | `GET /api/proxy-link/qr` (SVG) |
 | Webhook alerts | ✅ | `[webhooks]` config/secret/failover/start |
-| Front/Back split | ⏳ | v0.6 |
+| Front/Back split | ✅ | `[split]` mode front/back, протокол SGFB |
 
 ## Запуск новых возможностей v0.5
 
@@ -70,5 +70,25 @@ enabled = true
 urls = ["https://hooks.example.com/stealthgate"]
 events = ["config_reloaded", "secret_updated", "backend_failover", "proxy_started"]
 ```
+
+## Front/Back split (v0.6)
+
+```bash
+# Back relay
+[split]
+mode = "back"
+auth_token = "shared-secret-min-16-chars"
+back_listen_host = "0.0.0.0"
+back_listen_port = 8444
+front_allowlist = ["10.0.0.1"]
+
+# Front edge
+[split]
+mode = "front"
+auth_token = "shared-secret-min-16-chars"
+back_servers = ["10.0.0.2:8444"]
+```
+
+См. [SPLIT.md](./SPLIT.md).
 
 См. также: [WEBUI.md](./WEBUI.md), [MCP.md](./MCP.md), [CURSOR.md](./CURSOR.md).

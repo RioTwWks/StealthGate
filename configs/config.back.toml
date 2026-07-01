@@ -1,0 +1,54 @@
+[listen]
+# Опциональный публичный порт (fallback/metrics); основной — split.back_listen
+host = "127.0.0.1"
+port = 8443
+
+[tls]
+fake_domain = "example.com"
+
+[mtproto]
+secret = "ee0123456789abcdef0123456789abcdef"
+backend = "149.154.167.99:443"
+backends = ["149.154.175.50:443"]
+failover_strategy = "priority"
+
+[split]
+mode = "back"
+auth_token = "change-me-front-back-token"
+back_listen_host = "0.0.0.0"
+back_listen_port = 8444
+front_allowlist = ["10.0.0.1"]
+
+[fallback]
+static_html = "web/index.html"
+
+[fragmentation]
+enabled = true
+chunk_sizes = [1, 2, 3, 2, 1]
+
+[drs]
+enabled = false
+
+[security]
+antireplay_cache_size = 1024
+
+[network]
+backend_timeout_secs = 30
+
+[metrics]
+enabled = true
+host = "127.0.0.1"
+port = 9092
+
+[admin]
+socket = "/tmp/stealth-gate-back.sock"
+
+[webui]
+enabled = true
+host = "127.0.0.1"
+port = 8089
+session_secret = "change-me-in-production"
+users_file = "data/users-back.json"
+
+[webhooks]
+enabled = false

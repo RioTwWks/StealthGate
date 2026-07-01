@@ -43,6 +43,14 @@ record_sizes = [512, 1024, 1398, 256]
 min_chunk_size = 64
 max_chunk_size = 1024
 
+[split]
+# mode = "monolith"  # monolith | front | back
+# auth_token = "shared-secret-min-16-chars"
+# back_servers = ["10.0.0.2:8444"]
+# back_listen_host = "0.0.0.0"
+# back_listen_port = 8444
+# front_allowlist = ["10.0.0.1"]
+
 [webhooks]
 enabled = false
 urls = []

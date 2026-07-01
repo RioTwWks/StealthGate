@@ -179,7 +179,7 @@ urls = ["http://127.0.0.1:9999/hook"]
 
 Готовый конфиг MCP для проекта: [`.cursor/mcp.json`](.cursor/mcp.json).
 
-Подробнее: [docs/ROADMAP.md](docs/ROADMAP.md) — статус фич v0.5.0.
+Подробнее: [docs/ROADMAP.md](docs/ROADMAP.md) — статус фич v0.6.0. Front/Back split: [docs/SPLIT.md](docs/SPLIT.md).
 
 ## 📄 Лицензия
 

@@ -56,6 +56,12 @@ pub fn render_prometheus(state: &AppState) -> String {
     "stealthgate_domain_fronted_total",
     stats.domain_fronted,
   );
+  append_counter(&mut out, "stealthgate_split_relayed_total", stats.split_relayed);
+  append_counter(
+    &mut out,
+    "stealthgate_split_auth_failed_total",
+    stats.split_auth_failed,
+  );
 
   if let Some(summary) = summary {
   append_gauge(

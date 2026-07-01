@@ -1,0 +1,52 @@
+[listen]
+host = "0.0.0.0"
+port = 443
+
+[tls]
+cert_file = "certs/cert.pem"
+key_file = "certs/key.pem"
+fake_domain = "www.cloudflare.com"
+
+[mtproto]
+# backend используется как hint для back-узла
+secret = "ee0123456789abcdef0123456789abcdef"
+backend = "149.154.167.99:443"
+
+[split]
+mode = "front"
+auth_token = "change-me-front-back-token"
+back_servers = ["10.0.0.2:8444", "10.0.0.3:8444"]
+connect_timeout_secs = 10
+
+[fallback]
+static_html = "web/index.html"
+domain_fronting = "sni"
+fronting_port = 443
+
+[fragmentation]
+enabled = true
+chunk_sizes = [1, 2, 3, 2, 1]
+
+[security]
+antireplay_cache_size = 65536
+
+[network]
+backend_timeout_secs = 30
+
+[metrics]
+enabled = true
+host = "127.0.0.1"
+port = 9091
+
+[admin]
+socket = "/tmp/stealth-gate.sock"
+
+[webui]
+enabled = true
+host = "127.0.0.1"
+port = 8088
+session_secret = "change-me-in-production"
+users_file = "data/users.json"
+
+[webhooks]
+enabled = false

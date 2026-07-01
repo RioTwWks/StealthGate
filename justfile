@@ -47,3 +47,13 @@ install-service: build
 # Удаление systemd-сервиса одной командой (требует root)
 uninstall-service:
     sudo bash deploy/uninstall.sh --purge
+
+# Front/Back split (примеры конфигов: configs/config.front.toml, configs/config.back.toml)
+run-front: build
+    ./target/release/stealth-gate --config configs/config.front.toml
+
+run-back: build
+    ./target/release/stealth-gate --config configs/config.back.toml
+
+test-split:
+    cargo test --test split -- --nocapture

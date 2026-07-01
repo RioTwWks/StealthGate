@@ -16,6 +16,7 @@ pub mod mcp;
 pub mod metrics;
 pub mod network;
 pub mod proxy;
+pub mod split;
 pub mod state;
 pub mod system_ops;
 pub mod tls;
