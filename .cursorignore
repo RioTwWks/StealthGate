@@ -33,3 +33,5 @@ Thumbs.db
 *.pem
 *.key
 *.crt
+data/users.json
+configs/*.local.toml

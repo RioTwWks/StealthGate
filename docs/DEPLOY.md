@@ -20,6 +20,17 @@ just install-service
 - включает `admin.uninstall_enabled` в `/etc/stealth-gate/config.toml`
 - настраивает sudo для удаления из WebUI
 
+## Front/Back split в production
+
+Для split-деploy запусти **два** экземпляра с разными конфигами:
+
+| Узел | Конфиг | Роль |
+|------|--------|------|
+| Публичный VPS | `configs/config.front.toml` | `[split].mode = "front"` |
+| Internal relay | `configs/config.back.toml` | `[split].mode = "back"` |
+
+Back слушает SGFB на internal interface (`back_listen_port`, по умолчанию 8444). Front подключается к `back_servers`. Подробнее: [SPLIT.md](./SPLIT.md).
+
 ## Удаление одной командой
 
 ```bash
@@ -47,6 +58,8 @@ just uninstall-service
 Требования:
 - `admin.uninstall_enabled = true` в конфиге
 - скрипт `/opt/stealth-gate/bin/uninstall` и sudoers (настраивается install.sh)
+
+API: `POST /api/system/uninstall` — см. [WEBUI.md](./WEBUI.md).
 
 ## Пути по умолчанию
 

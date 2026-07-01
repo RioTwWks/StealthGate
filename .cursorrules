@@ -1,4 +1,4 @@
-# Rust Project Rules for Cursor
+# Rust Project Rules for Cursor — StealthGate
 
 ## Роль
 Ты — экспертный Rust-разработчик, специализирующийся на сетевом программировании и асинхронном I/O.
@@ -13,38 +13,58 @@
 - Для сетевого программирования: `tokio::net`
 - Для TLS: `rustls` (предпочтительнее OpenSSL)
 - Для работы с MTProto: кастомная реализация на основе `tokio::io`
-- Для логирования: `tracing` или `log`
-- Для конфигурации: `serde` + `toml` или `yaml`
-- Для тестов: стандартный `#[test]` + интеграционные тесты в `tests/`
+- WebUI: axum + signed cookies
+- MCP: rmcp (stdio и streamable HTTP)
+- Для логирования: `tracing`
+- Для конфигурации: `serde` + TOML
+- Для тестов: `#[test]` + интеграционные тесты в `tests/`
 
-## Принципы разработки[reference:9]
+## Принципы разработки
 1. **Безопасность**: Используй `unwrap()` только в прототипах. В финальном коде — всегда обрабатывай `Result` и `Option`.
 2. **Владение**: Четко понимай, кто владеет данными. Используй `Rc`/`Arc` только когда действительно нужно разделяемое владение.
-3. **Ошибки**: Используй кастомные типы ошибок (например, через `thiserror`). Все ошибки должны быть контекстными.
+3. **Ошибки**: Используй кастомные типы ошибок (через `thiserror`). Все ошибки должны быть контекстными.
 4. **Асинхронность**: Для всех I/O операций используй async/await. Никогда не блокируй асинхронный рантайм синхронными вызовами.
-5. **Структура**: 
-   - `src/bin/` — исполняемые файлы
+5. **Структура**:
+   - `src/bin/` — исполняемые файлы (`stealth-gate`, `stealth-gate-mcp`)
    - `src/lib.rs` — основная библиотека
-   - `src/` — модули по функциональности (acceptor, detector, proxy, tls)
-   - `benches/` — бенчмарки
-   - `examples/` — примеры использования
+   - `src/` — модули по функциональности
+   - `configs/` — примеры TOML (monolith, front, back)
+   - `deploy/` — systemd unit, install/uninstall
+   - `docs/` — документация
+   - `tests/` — интеграционные тесты
+   - `examples/` — примеры (`webhook-receiver`)
 
-## Архитектура прокси (адаптирована для Rust)
-Проект — асинхронный TCP-прокси с маскировкой под TLS.
-1. **Акцептор**: Использует `TcpListener` из Tokio.
-2. **Детектор**: Парсит TLS ClientHello (можно использовать `rustls` для низкоуровневого доступа).
-3. **Обработчик**: Два варианта:
-   - Для MTProto-клиентов — проксирование через `tokio::io::copy_bidirectional`.
-   - Для остальных — ответ статичной HTML-заглушкой или прокси в реальный сайт.
-4. **Конфигурация**: Загружается из `config.toml` через `serde`.
+## Архитектура прокси
+
+### Monolith (по умолчанию)
+1. **Акцептор** (`acceptor.rs`) — `TcpListener`, маршрутизация соединений.
+2. **Детектор** (`detector.rs`) — парсит TLS ClientHello, проверяет MTProto-секрет.
+3. **Обработчик MTProto** — проксирование через `tokio::io::copy_bidirectional`:
+   - classic/ee-секрет → `fragmentation` или `drs`
+   - dd-секрет → `dd_protocol`
+   - multi-backend → `backend_pool` с failover
+4. **Fallback** — TLS-терминация (`tls_server`) или domain fronting, HTML-заглушка.
+5. **Конфигурация** — TOML через `serde`, hot-reload через WebUI/MCP/admin.
+
+### Front/Back split (v0.6)
+- **Front** — публичный edge: детекция, anti-replay, relay на back по протоколу SGFB (`split.rs`).
+- **Back** — внутренний relay: принимает SGFB, подключается к Telegram DC.
+- Режим задаётся `[split].mode`: `monolith` | `front` | `back`.
+- Документация: `docs/SPLIT.md`.
+
+## Дополнительные подсистемы
+- **WebUI** (`src/web/`) — REST `/api`, роли admin/operator/viewer.
+- **MCP** (`src/mcp/`) — `get_stats`, `get_config`, `get_proxy_link`, `reload_config`, `update_secret`.
+- **Webhooks** (`src/webhooks.rs`) — события config/secret/failover/start.
+- **Metrics** (`src/metrics.rs`) — Prometheus на `[metrics].port`.
+- **Deploy** (`deploy/`) — systemd, удаление через CLI или WebUI (`system_ops.rs`).
 
 ## Тестирование
-- Пиши unit-тесты для всей критической логики.
-- Используй `#[cfg(test)]` для тестовых утилит.
-- Для интеграционных тестов используй `tokio::test`.
+- Unit-тесты в модулях (`#[cfg(test)]`).
+- Интеграционные: `tests/webui.rs`, `tests/split.rs`, `tests/webhooks.rs`, `tests/mcp_http.rs` и др.
+- Перед коммитом: `cargo test` и `cargo clippy -- -D warnings`.
 
 ## Процесс работы
-1. Всегда учитывай производительность: избегай лишних аллокаций, копирований.
-2. Предлагай использовать `zero-copy` где это возможно.
-3. Код должен быть документирован (`///` для публичных API).
-4. Следуй рекомендациям Clippy (в проекте должен быть `clippy.toml` или настройки в `Cargo.toml`).
+1. Учитывай производительность: избегай лишних аллокаций.
+2. Код документируй (`///` для публичных API).
+3. Следуй Clippy. Контекст проекта — в `.cursor/rules/stealthgate.md`.
