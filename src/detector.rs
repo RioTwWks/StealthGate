@@ -56,7 +56,7 @@ impl DetectionResult {
 #[derive(Debug, Clone)]
 pub struct Detector {
   routes: Vec<SecretRouteBytes>,
-  fake_domain: String,
+  fake_domains: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,8 +70,12 @@ struct SecretRouteBytes {
 
 impl Detector {
   /// Создаёт детектор из списка секретов.
-  pub fn from_routes(routes: &[SecretRoute], fake_domain: impl Into<String>) -> Result<Self> {
-    let fake_domain = fake_domain.into();
+  pub fn from_routes(routes: &[SecretRoute], fake_domains: &[String]) -> Result<Self> {
+    if fake_domains.is_empty() {
+      return Err(crate::error::StealthGateError::Config(
+        "нужен хотя бы один SNI-домен для детектора".into(),
+      ));
+    }
     let mut parsed = Vec::new();
     for route in routes {
       parsed.push(SecretRouteBytes {
@@ -84,7 +88,7 @@ impl Detector {
     }
     Ok(Self {
       routes: parsed,
-      fake_domain,
+      fake_domains: fake_domains.to_vec(),
     })
   }
 
@@ -98,7 +102,7 @@ impl Detector {
         backend: String::new(),
         max_connections: 0,
       }],
-      fake_domain,
+      &[fake_domain.into()],
     )
   }
 
@@ -120,7 +124,7 @@ impl Detector {
 
     if looks_like_tls_client_hello(data) {
       if let Some(ref domain) = sni {
-        if domain.eq_ignore_ascii_case(&self.fake_domain) {
+        if self.matches_fake_domain(domain) {
           let route = self.routes.first();
           return DetectionResult::mtproto(
             sni.clone(),
@@ -134,6 +138,13 @@ impl Detector {
     }
 
     DetectionResult::fallback(sni)
+  }
+
+  fn matches_fake_domain(&self, domain: &str) -> bool {
+    self
+      .fake_domains
+      .iter()
+      .any(|candidate| candidate.eq_ignore_ascii_case(domain))
   }
 
   fn contains_secret(&self, data: &[u8], secret: &[u8]) -> bool {
@@ -190,7 +201,7 @@ mod tests {
       backend: "1.1.1.1:443".into(),
       max_connections: 0,
     }];
-    let detector = Detector::from_routes(&routes, "example.com").expect("detector");
+    let detector = Detector::from_routes(&routes, &["example.com".into()]).expect("detector");
     let secret_bytes = decode_secret("dd0123456789abcdef0123456789abcdef").expect("bytes");
     let mut payload = vec![0u8; 64];
     payload.extend_from_slice(&secret_bytes);
@@ -216,7 +227,7 @@ mod tests {
         max_connections: 10,
       },
     ];
-    let detector = Detector::from_routes(&routes, "example.com").expect("detector");
+    let detector = Detector::from_routes(&routes, &["example.com".into()]).expect("detector");
     let secret_bytes = decode_secret("eeabcdefabcdefabcdefabcdefabcdefab").expect("bytes");
     let mut payload = vec![0u8; 64];
     payload.extend_from_slice(&secret_bytes);
@@ -226,5 +237,31 @@ mod tests {
     assert_eq!(result.secret_mode, Some(SecretMode::Ee));
     assert_eq!(result.backend.as_deref(), Some("2.2.2.2:443"));
     assert_eq!(result.max_connections, 10);
+  }
+
+  #[test]
+  fn detects_ee_by_any_sni_in_pool() {
+    use crate::tls::test_support::build_client_hello;
+
+    let routes = vec![SecretRoute {
+      label: "default".into(),
+      secret: "ee0123456789abcdef0123456789abcdef".into(),
+      mode: SecretMode::Ee,
+      backend: "1.1.1.1:443".into(),
+      max_connections: 0,
+    }];
+    let detector = Detector::from_routes(
+      &routes,
+      &["cloudflare.com".into(), "google.com".into()],
+    )
+    .expect("detector");
+
+    let payload = build_client_hello("google.com");
+    let result = detector.detect(&payload);
+    assert_eq!(result.traffic_type, TrafficType::Mtproto);
+
+    let payload = build_client_hello("example.com");
+    let result = detector.detect(&payload);
+    assert_eq!(result.traffic_type, TrafficType::Fallback);
   }
 }

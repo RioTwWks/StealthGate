@@ -34,6 +34,19 @@ pub enum DomainFrontingMode {
   Fixed,
 }
 
+/// Стратегия ротации значений в пуле SNI / fingerprint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RotationMode {
+  /// Все значения пула активны одновременно (для детекции / enforce).
+  #[default]
+  None,
+  /// Случайный выбор при каждом соединении / запросе proxy-link.
+  PerConnection,
+  /// Смена активного значения по таймеру.
+  TimeBased,
+}
+
 /// TLS-настройки для маскировки и терминации.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {
@@ -41,9 +54,55 @@ pub struct TlsConfig {
   pub cert_file: Option<String>,
   pub key_file: Option<String>,
   pub ja4_profile: Option<String>,
+  /// Дополнительные SNI-домены для ee-детекции (помимо fake_domain).
+  #[serde(default)]
+  pub sni_pool: Vec<String>,
+  #[serde(default)]
+  pub sni_rotation: RotationMode,
+  /// Дополнительные JA4-профили (префиксы или алиасы вроде chrome_120).
+  #[serde(default)]
+  pub fingerprint_pool: Vec<String>,
+  #[serde(default)]
+  pub fingerprint_rotation: RotationMode,
+  /// Интервал ротации для time_based (секунды).
+  #[serde(default = "default_rotation_interval_secs")]
+  pub rotation_interval_secs: u64,
+}
+
+fn default_rotation_interval_secs() -> u64 {
+  300
 }
 
 impl TlsConfig {
+  /// Валидирует TLS-секцию.
+  pub fn validate(&self) -> Result<()> {
+    if self.fake_domain.trim().is_empty() {
+      return Err(StealthGateError::Config(
+        "tls.fake_domain не может быть пустым".into(),
+      ));
+    }
+    for domain in &self.sni_pool {
+      if domain.trim().is_empty() {
+        return Err(StealthGateError::Config(
+          "tls.sni_pool не может содержать пустые значения".into(),
+        ));
+      }
+    }
+    for profile in &self.fingerprint_pool {
+      if profile.trim().is_empty() {
+        return Err(StealthGateError::Config(
+          "tls.fingerprint_pool не может содержать пустые значения".into(),
+        ));
+      }
+    }
+    if self.rotation_interval_secs == 0 {
+      return Err(StealthGateError::Config(
+        "tls.rotation_interval_secs должен быть > 0".into(),
+      ));
+    }
+    Ok(())
+  }
+
   /// TLS-терминация доступна, если заданы оба PEM-файла.
   pub fn is_enabled(&self) -> bool {
     self
@@ -51,6 +110,33 @@ impl TlsConfig {
       .as_ref()
       .zip(self.key_file.as_ref())
       .is_some_and(|(cert, key)| Path::new(cert).exists() && Path::new(key).exists())
+  }
+
+  /// Все SNI-домены для ee-детекции: fake_domain + sni_pool.
+  pub fn all_sni_domains(&self) -> Vec<String> {
+    crate::tls_pool::merge_unique(&self.fake_domain, &self.sni_pool)
+  }
+
+  /// Все JA4-профили: ja4_profile + fingerprint_pool.
+  pub fn all_fingerprint_profiles(&self) -> Vec<String> {
+    let mut profiles = Vec::new();
+    if let Some(profile) = self.ja4_profile.as_ref().filter(|value| !value.trim().is_empty()) {
+      profiles.push(profile.clone());
+    }
+    for entry in &self.fingerprint_pool {
+      let trimmed = entry.trim();
+      if trimmed.is_empty() {
+        continue;
+      }
+      if profiles
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(trimmed))
+      {
+        continue;
+      }
+      profiles.push(trimmed.to_string());
+    }
+    profiles
   }
 }
 
@@ -616,6 +702,7 @@ impl Config {
     }
 
     self.split.validate()?;
+    self.tls.validate()?;
 
     Ok(())
   }
@@ -632,6 +719,11 @@ impl Config {
         key_file: None,
         fake_domain: "example.com".into(),
         ja4_profile: None,
+        sni_pool: Vec::new(),
+        sni_rotation: RotationMode::default(),
+        fingerprint_pool: Vec::new(),
+        fingerprint_rotation: RotationMode::default(),
+        rotation_interval_secs: default_rotation_interval_secs(),
       },
       mtproto: MtprotoConfig {
         secret: "0123456789abcdef0123456789abcdef".into(),
@@ -780,6 +872,11 @@ mod tests {
         cert_file: None,
         key_file: None,
         ja4_profile: None,
+        sni_pool: Vec::new(),
+        sni_rotation: RotationMode::default(),
+        fingerprint_pool: Vec::new(),
+        fingerprint_rotation: RotationMode::default(),
+        rotation_interval_secs: default_rotation_interval_secs(),
       },
       mtproto: MtprotoConfig {
         secret: "0123456789abcdef0123456789abcdef".into(),
@@ -807,5 +904,67 @@ mod tests {
       split: SplitConfig::default(),
     };
     assert!(config.validate().is_err());
+  }
+
+  #[test]
+  fn tls_pool_validation_rejects_empty_sni() {
+    let config = Config {
+      listen: ListenConfig {
+        host: "127.0.0.1".into(),
+        port: 443,
+      },
+      tls: TlsConfig {
+        fake_domain: "example.com".into(),
+        cert_file: None,
+        key_file: None,
+        ja4_profile: None,
+        sni_pool: vec!["".into()],
+        sni_rotation: RotationMode::default(),
+        fingerprint_pool: Vec::new(),
+        fingerprint_rotation: RotationMode::default(),
+        rotation_interval_secs: default_rotation_interval_secs(),
+      },
+      mtproto: MtprotoConfig {
+        secret: "0123456789abcdef0123456789abcdef".into(),
+        backend: "127.0.0.1:443".into(),
+        backends: Vec::new(),
+        failover_strategy: BackendFailoverStrategy::default(),
+        secrets: Vec::new(),
+      },
+      fallback: FallbackConfig {
+        upstream: None,
+        static_html: None,
+        domain_fronting: DomainFrontingMode::None,
+        fronting_host: None,
+        fronting_port: 443,
+      },
+      fragmentation: FragmentationConfig::default(),
+      drs: DrsConfig::default(),
+      dd: DdConfig::default(),
+      security: SecurityConfig::default(),
+      network: NetworkConfig::default(),
+      metrics: MetricsConfig::default(),
+      admin: AdminConfig::default(),
+      webui: WebuiConfig::default(),
+      webhooks: WebhooksConfig::default(),
+      split: SplitConfig::default(),
+    };
+    assert!(config.validate().is_err());
+  }
+
+  #[test]
+  fn all_sni_domains_merges_pool() {
+    let tls = TlsConfig {
+      fake_domain: "cloudflare.com".into(),
+      cert_file: None,
+      key_file: None,
+      ja4_profile: None,
+      sni_pool: vec!["google.com".into(), "cloudflare.com".into()],
+      sni_rotation: RotationMode::default(),
+      fingerprint_pool: Vec::new(),
+      fingerprint_rotation: RotationMode::default(),
+      rotation_interval_secs: default_rotation_interval_secs(),
+    };
+    assert_eq!(tls.all_sni_domains().len(), 2);
   }
 }

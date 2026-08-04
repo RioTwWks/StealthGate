@@ -6,6 +6,12 @@ port = 443
 cert_file = "certs/cert.pem"
 key_file = "certs/key.pem"
 fake_domain = "www.cloudflare.com"
+# Пул SNI для ee-детекции (клиент может использовать любой домен из списка)
+# sni_pool = ["google.com", "microsoft.com", "yandex.ru"]
+# sni_rotation = "per_connection"  # none | per_connection | time_based
+# fingerprint_pool = ["chrome_120", "firefox_122", "edge_120"]
+# fingerprint_rotation = "per_connection"
+# rotation_interval_secs = 300
 
 [mtproto]
 # backend используется как hint для back-узла

@@ -20,6 +20,7 @@ pub mod split;
 pub mod state;
 pub mod system_ops;
 pub mod tls;
+pub mod tls_pool;
 pub mod tls_server;
 pub mod users;
 pub mod web;

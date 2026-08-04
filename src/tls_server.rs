@@ -155,6 +155,11 @@ mod tests {
       key_file: Some("missing.key".into()),
       fake_domain: "example.com".into(),
       ja4_profile: None,
+      sni_pool: Vec::new(),
+      sni_rotation: crate::config::RotationMode::default(),
+      fingerprint_pool: Vec::new(),
+      fingerprint_rotation: crate::config::RotationMode::default(),
+      rotation_interval_secs: 300,
     };
     assert!(!cert_files_exist(&tls));
   }

@@ -8,6 +8,11 @@ key_file = "certs/key.pem"
 fake_domain = "www.cloudflare.com"
 # ja4_profile = "t13d..."
 # ja4_enforce через [security]
+# sni_pool = ["google.com", "microsoft.com", "yandex.ru"]
+# sni_rotation = "per_connection"
+# fingerprint_pool = ["chrome_120", "chrome_121", "firefox_122", "edge_120"]
+# fingerprint_rotation = "per_connection"
+# rotation_interval_secs = 300
 
 [mtproto]
 secret = "ee0123456789abcdef0123456789abcdef"

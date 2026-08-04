@@ -320,24 +320,44 @@ fn count_extensions(extensions: &[u8]) -> usize {
 
 /// Проверяет соответствие JA4 ожидаемому профилю (префикс или полное совпадение).
 pub fn ja4_matches(fingerprint: &str, profile: &str) -> bool {
-  fingerprint == profile || fingerprint.starts_with(profile)
+  let resolved = resolve_fingerprint_alias(profile);
+  fingerprint == resolved || fingerprint.starts_with(&resolved)
+}
+
+/// Проверяет соответствие JA4 любому профилю из пула.
+pub fn ja4_matches_any(fingerprint: &str, profiles: &[String]) -> bool {
+  if profiles.is_empty() {
+    return true;
+  }
+  profiles
+    .iter()
+    .any(|profile| ja4_matches(fingerprint, profile))
+}
+
+/// Разрешает алиас fingerprint (chrome_120 и т.д.) в JA4-префикс.
+pub fn resolve_fingerprint_alias(profile: &str) -> String {
+  match profile.trim().to_ascii_lowercase().as_str() {
+    "chrome_120" | "chrome_121" | "chrome_122" => "t13d".into(),
+    "firefox_122" | "firefox_123" => "t13d".into(),
+    "edge_120" | "edge_121" => "t13d".into(),
+    "safari_17" => "t13d".into(),
+    other => other.to_string(),
+  }
 }
 
 #[cfg(test)]
-mod tests {
-  use super::*;
-
-  fn build_client_hello(sni: &str) -> Vec<u8> {
+pub mod test_support {
+  /// Собирает минимальный TLS ClientHello с SNI для unit-тестов.
+  pub fn build_client_hello(sni: &str) -> Vec<u8> {
     let mut handshake = Vec::new();
-    handshake.push(0x01); // ClientHello
-    handshake.extend_from_slice(&[0x00, 0x00, 0x00]); // length placeholder
-    handshake.extend_from_slice(&[0x03, 0x03]); // TLS 1.2
-    handshake.extend_from_slice(&[0u8; 32]); // random
-    handshake.push(0x00); // session id length
-
-    handshake.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher suites
     handshake.push(0x01);
-    handshake.push(0x00); // compression
+    handshake.extend_from_slice(&[0x00, 0x00, 0x00]);
+    handshake.extend_from_slice(&[0x03, 0x03]);
+    handshake.extend_from_slice(&[0u8; 32]);
+    handshake.push(0x00);
+    handshake.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+    handshake.push(0x01);
+    handshake.push(0x00);
 
     let host = sni.as_bytes();
     let mut sni_list = Vec::new();
@@ -360,12 +380,18 @@ mod tests {
     handshake[3] = (hs_len & 0xff) as u8;
 
     let mut record = Vec::new();
-    record.push(0x16); // handshake
-    record.extend_from_slice(&[0x03, 0x01]); // TLS 1.0 record version
+    record.push(0x16);
+    record.extend_from_slice(&[0x03, 0x01]);
     record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
     record.extend_from_slice(&handshake);
     record
   }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use super::test_support::build_client_hello;
 
   #[test]
   fn parse_tls_client_hello_with_sni() {
@@ -377,5 +403,14 @@ mod tests {
     let ja4 = compute_ja4(&hello);
     assert!(ja4.starts_with('t'));
     assert!(ja4.contains('_'));
+  }
+
+  #[test]
+  fn ja4_alias_resolves_to_prefix() {
+    assert_eq!(resolve_fingerprint_alias("chrome_120"), "t13d");
+    assert!(ja4_matches(
+      "t13d1516h2_abc123_def456",
+      "chrome_120"
+    ));
   }
 }

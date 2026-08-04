@@ -63,6 +63,11 @@ fn tls_server_loads_generated_cert() {
     key_file: Some("certs/key.pem".into()),
     fake_domain: "www.cloudflare.com".into(),
     ja4_profile: None,
+    sni_pool: Vec::new(),
+    sni_rotation: stealth_gate::config::RotationMode::default(),
+    fingerprint_pool: Vec::new(),
+    fingerprint_rotation: stealth_gate::config::RotationMode::default(),
+    rotation_interval_secs: 300,
   };
   assert!(tls.is_enabled());
   tls_server::load_server_config(&tls).expect("load tls config");

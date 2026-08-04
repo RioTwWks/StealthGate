@@ -18,19 +18,19 @@ use crate::metrics;
 use crate::proxy;
 use crate::split;
 use crate::state::AppState;
-use crate::tls::{compute_ja4, ja4_matches, looks_like_tls_client_hello, parse_client_hello, parse_record};
+use crate::tls::{compute_ja4, ja4_matches_any, looks_like_tls_client_hello, parse_client_hello, parse_record};
 use crate::tls_server;
 
 const PEEK_BUFFER_SIZE: usize = 4096;
 
 struct ConnectionContext {
-  fake_domain: String,
+  fake_domains: Vec<String>,
   default_backend: String,
   fragmentation: crate::config::FragmentationConfig,
   fallback_cfg: crate::config::FallbackConfig,
   network: crate::config::NetworkConfig,
   tls_enabled: bool,
-  ja4_profile: Option<String>,
+  ja4_profiles: Vec<String>,
   ja4_enforce: bool,
   max_connections_per_ip: u32,
 }
@@ -63,8 +63,8 @@ pub async fn handle_connection(mut client: TcpStream, state: Arc<AppState>) -> R
   let detection = detect_with_security(
     &state,
     &peek_buf,
-    &ctx.fake_domain,
-    ctx.ja4_profile.as_deref(),
+    &ctx.fake_domains,
+    &ctx.ja4_profiles,
     ctx.ja4_enforce,
   )?;
 
@@ -107,13 +107,13 @@ fn load_connection_context(state: &AppState) -> Result<ConnectionContext> {
     .read()
     .map_err(|_| StealthGateError::Config("блокировка config poisoned".into()))?;
   Ok(ConnectionContext {
-    fake_domain: config.tls.fake_domain.clone(),
+    fake_domains: config.tls.all_sni_domains(),
     default_backend: config.mtproto.backend.clone(),
     fragmentation: config.fragmentation.clone(),
     fallback_cfg: config.fallback.clone(),
     network: config.network.clone(),
     tls_enabled: config.tls.is_enabled(),
-    ja4_profile: config.tls.ja4_profile.clone(),
+    ja4_profiles: config.tls.all_fingerprint_profiles(),
     ja4_enforce: config.security.ja4_enforce,
     max_connections_per_ip: config.security.max_connections_per_ip,
   })
@@ -122,8 +122,8 @@ fn load_connection_context(state: &AppState) -> Result<ConnectionContext> {
 fn detect_with_security(
   state: &AppState,
   peek_buf: &[u8],
-  fake_domain: &str,
-  ja4_profile: Option<&str>,
+  fake_domains: &[String],
+  ja4_profiles: &[String],
   ja4_enforce: bool,
 ) -> Result<DetectionResult> {
   if looks_like_tls_client_hello(peek_buf) {
@@ -151,14 +151,14 @@ fn detect_with_security(
     config.mtproto.all_secrets()
   };
 
-  let detector = Detector::from_routes(&routes, fake_domain)?;
+  let detector = Detector::from_routes(&routes, fake_domains)?;
   let mut detection = detector.detect(peek_buf);
 
-  log_ja4(peek_buf, ja4_profile);
+  log_ja4(peek_buf, ja4_profiles);
 
   if detection.traffic_type == TrafficType::Mtproto
     && ja4_enforce
-    && !ja4_allowed(peek_buf, ja4_profile)
+    && !ja4_allowed(peek_buf, ja4_profiles)
   {
     tracing::info!("JA4 enforce: соединение переведено в fallback");
     detection.traffic_type = TrafficType::Fallback;
@@ -286,10 +286,10 @@ async fn handle_fallback_path(
   .await
 }
 
-fn ja4_allowed(data: &[u8], expected_profile: Option<&str>) -> bool {
-  let Some(profile) = expected_profile else {
+fn ja4_allowed(data: &[u8], profiles: &[String]) -> bool {
+  if profiles.is_empty() {
     return true;
-  };
+  }
   if !looks_like_tls_client_hello(data) {
     return true;
   }
@@ -299,7 +299,7 @@ fn ja4_allowed(data: &[u8], expected_profile: Option<&str>) -> bool {
   let Ok(hello) = parse_client_hello(record.payload) else {
     return false;
   };
-  ja4_matches(&compute_ja4(&hello), profile)
+  ja4_matches_any(&compute_ja4(&hello), profiles)
 }
 
 fn extract_sni(data: &[u8]) -> Option<String> {
@@ -311,7 +311,7 @@ fn extract_sni(data: &[u8]) -> Option<String> {
   hello.sni
 }
 
-fn log_ja4(data: &[u8], expected_profile: Option<&str>) {
+fn log_ja4(data: &[u8], profiles: &[String]) {
   if !looks_like_tls_client_hello(data) {
     return;
   }
@@ -324,14 +324,15 @@ fn log_ja4(data: &[u8], expected_profile: Option<&str>) {
   };
 
   let ja4 = compute_ja4(&hello);
-  if let Some(profile) = expected_profile {
-    if ja4_matches(&ja4, profile) {
-      tracing::info!(%ja4, "JA4 совпадает с профилем");
-    } else {
-      tracing::debug!(%ja4, expected = profile, "JA4 не совпадает с профилем");
-    }
-  } else {
+  if profiles.is_empty() {
     tracing::debug!(%ja4, "JA4 фингерпринт ClientHello");
+    return;
+  }
+
+  if ja4_matches_any(&ja4, profiles) {
+    tracing::info!(%ja4, profiles = ?profiles, "JA4 совпадает с профилем из пула");
+  } else {
+    tracing::debug!(%ja4, profiles = ?profiles, "JA4 не совпадает с пулом профилей");
   }
 }
 
@@ -445,8 +446,17 @@ pub(crate) async fn shutdown_signal() {
 }
 
 /// Утилита для тестов: детекция без сети.
-pub fn detect_traffic(data: &[u8], secret: &str, fake_domain: &str) -> Result<DetectionResult> {
-  let detector = Detector::new(secret, fake_domain)?;
+pub fn detect_traffic(data: &[u8], secret: &str, fake_domains: &[String]) -> Result<DetectionResult> {
+  let detector = Detector::from_routes(
+    &[crate::config::SecretRoute {
+      label: "default".into(),
+      secret: secret.into(),
+      mode: crate::config::secret_mode(secret),
+      backend: String::new(),
+      max_connections: 0,
+    }],
+    fake_domains,
+  )?;
   Ok(detector.detect(data))
 }
 

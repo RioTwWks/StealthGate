@@ -6,11 +6,51 @@ use serde::{Deserialize, Serialize};
 
 use crate::antireplay::AntiReplayCache;
 use crate::backend_pool::BackendPool;
-use crate::config::{Config, FragmentationConfig, MtprotoConfig, WebhooksConfig};
+use crate::config::{Config, FragmentationConfig, MtprotoConfig, TlsConfig, WebhooksConfig};
 use crate::error::{Result, StealthGateError};
 use crate::limits::ConnectionLimiter;
+use crate::tls_pool::RotationSelector;
 use crate::users::UserStore;
 use crate::webhooks::{dispatch, WebhookEvent};
+
+/// Состояние ротации SNI / fingerprint.
+#[derive(Debug)]
+pub struct TlsRotationState {
+  sni: RotationSelector,
+  fingerprint: RotationSelector,
+}
+
+impl TlsRotationState {
+  /// Создаёт селекторы из TLS-конфигурации.
+  pub fn from_tls(tls: &TlsConfig) -> Self {
+    Self {
+      sni: RotationSelector::new(
+        tls.sni_pool.clone(),
+        tls.sni_rotation,
+        Some(tls.rotation_interval_secs),
+      ),
+      fingerprint: RotationSelector::new(
+        tls.fingerprint_pool.clone(),
+        tls.fingerprint_rotation,
+        Some(tls.rotation_interval_secs),
+      ),
+    }
+  }
+
+  /// Активный SNI для proxy-link / UI.
+  pub fn active_sni(&self, tls: &TlsConfig) -> String {
+    self.sni.select(&tls.fake_domain)
+  }
+
+  /// Активный fingerprint-профиль для UI.
+  pub fn active_fingerprint(&self, tls: &TlsConfig) -> Option<String> {
+    let profiles = tls.all_fingerprint_profiles();
+    if profiles.is_empty() {
+      return None;
+    }
+    Some(self.fingerprint.select(profiles.first().expect("profile")))
+  }
+}
 
 /// Счётчики прокси в реальном времени.
 #[derive(Debug, Default)]
@@ -81,6 +121,7 @@ pub struct AppState {
   pub antireplay: AntiReplayCache,
   pub limits: ConnectionLimiter,
   pub backend_pool: RwLock<Arc<BackendPool>>,
+  pub tls_rotation: RwLock<TlsRotationState>,
 }
 
 impl AppState {
@@ -90,6 +131,7 @@ impl AppState {
     let users = UserStore::load(&config.webui.users_file)?;
     let antireplay = AntiReplayCache::new(config.security.antireplay_cache_size);
     let backend_pool = Arc::new(BackendPool::from_config(&config.mtproto));
+    let tls_rotation = TlsRotationState::from_tls(&config.tls);
     Ok(Arc::new(Self {
       config: RwLock::new(config),
       config_path,
@@ -98,6 +140,7 @@ impl AppState {
       antireplay,
       limits: ConnectionLimiter::default(),
       backend_pool: RwLock::new(backend_pool),
+      tls_rotation: RwLock::new(tls_rotation),
     }))
   }
 
@@ -107,6 +150,22 @@ impl AppState {
       .read()
       .map_err(|_| StealthGateError::Config("блокировка config poisoned".into()))?;
     Ok(config.webhooks.clone())
+  }
+
+  fn sync_tls_rotation(&self) -> Result<()> {
+    let tls = {
+      let config = self
+        .config
+        .read()
+        .map_err(|_| StealthGateError::Config("блокировка config poisoned".into()))?;
+      config.tls.clone()
+    };
+    let mut rotation = self
+      .tls_rotation
+      .write()
+      .map_err(|_| StealthGateError::Config("блокировка tls_rotation poisoned".into()))?;
+    *rotation = TlsRotationState::from_tls(&tls);
+    Ok(())
   }
 
   fn sync_backend_pool(&self) -> Result<()> {
@@ -150,6 +209,7 @@ impl AppState {
       .write()
       .map_err(|_| StealthGateError::Config("блокировка config poisoned".into()))? = fresh;
     self.sync_backend_pool()?;
+    self.sync_tls_rotation()?;
     dispatch(
       &self.webhooks_config()?,
       WebhookEvent::ConfigReloaded,
@@ -205,6 +265,7 @@ impl AppState {
     }
     self.save_config()?;
     self.sync_backend_pool()?;
+    self.sync_tls_rotation()?;
     dispatch(
       &self.webhooks_config()?,
       WebhookEvent::SecretUpdated,
@@ -228,6 +289,7 @@ impl AppState {
     }
     self.save_config()?;
     self.sync_backend_pool()?;
+    self.sync_tls_rotation()?;
     Ok(())
   }
 
@@ -263,6 +325,17 @@ impl AppState {
     Ok(ConfigSummary {
       listen: format!("{}:{}", config.listen.host, config.listen.port),
       fake_domain: config.tls.fake_domain.clone(),
+      active_sni: {
+        let rotation = self
+          .tls_rotation
+          .read()
+          .map_err(|_| StealthGateError::Config("блокировка tls_rotation poisoned".into()))?;
+        rotation.active_sni(&config.tls)
+      },
+      sni_pool_count: config.tls.all_sni_domains().len(),
+      sni_rotation: format!("{:?}", config.tls.sni_rotation).to_lowercase(),
+      fingerprint_pool_count: config.tls.all_fingerprint_profiles().len(),
+      fingerprint_rotation: format!("{:?}", config.tls.fingerprint_rotation).to_lowercase(),
       backend: config.mtproto.backend.clone(),
       secret_prefix: config.mtproto.secret.chars().take(4).collect(),
       secrets_count: 1 + config.mtproto.secrets.len(),
@@ -301,6 +374,11 @@ impl AppState {
 pub struct ConfigSummary {
   pub listen: String,
   pub fake_domain: String,
+  pub active_sni: String,
+  pub sni_pool_count: usize,
+  pub sni_rotation: String,
+  pub fingerprint_pool_count: usize,
+  pub fingerprint_rotation: String,
   pub backend: String,
   pub secret_prefix: String,
   pub secrets_count: usize,
