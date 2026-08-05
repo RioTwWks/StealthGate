@@ -141,6 +141,7 @@ where
       inner: reader,
       enc,
       dec,
+      pending_write: Vec::new(),
     },
     dc_id: dc_idx,
   })
@@ -237,6 +238,8 @@ pub struct ObfuscatedStream<S> {
   inner: S,
   enc: AesCtr256,
   dec: AesCtr256,
+  /// Недописанный ciphertext (при partial write во внутренний поток).
+  pending_write: Vec<u8>,
 }
 
 impl<S> ObfuscatedStream<S> {
@@ -245,6 +248,7 @@ impl<S> ObfuscatedStream<S> {
       inner,
       enc: keys.enc,
       dec: keys.dec,
+      pending_write: Vec::new(),
     }
   }
 
@@ -281,12 +285,70 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ObfuscatedStream<S> {
     cx: &mut Context<'_>,
     buf: &[u8],
   ) -> Poll<std::io::Result<usize>> {
-    let mut out = buf.to_vec();
-    self.enc.apply_keystream(&mut out);
-    Pin::new(&mut self.inner).poll_write(cx, &out)
+    loop {
+      if !self.pending_write.is_empty() {
+        let pending = std::mem::take(&mut self.pending_write);
+        match Pin::new(&mut self.inner).poll_write(cx, &pending) {
+          Poll::Ready(Ok(0)) => {
+            self.pending_write = pending;
+            return Poll::Ready(Err(std::io::Error::new(
+              std::io::ErrorKind::WriteZero,
+              "write zero",
+            )));
+          }
+          Poll::Ready(Ok(n)) => {
+            if n < pending.len() {
+              self.pending_write = pending[n..].to_vec();
+              return Poll::Pending;
+            }
+          }
+          Poll::Ready(Err(err)) => {
+            self.pending_write = pending;
+            return Poll::Ready(Err(err));
+          }
+          Poll::Pending => {
+            self.pending_write = pending;
+            return Poll::Pending;
+          }
+        }
+      }
+
+      if buf.is_empty() {
+        return Poll::Ready(Ok(0));
+      }
+
+      let mut out = buf.to_vec();
+      self.enc.apply_keystream(&mut out);
+
+      match Pin::new(&mut self.inner).poll_write(cx, &out) {
+        Poll::Ready(Ok(0)) => {
+          return Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "write zero",
+          )));
+        }
+        Poll::Ready(Ok(n)) if n < out.len() => {
+          self.pending_write = out[n..].to_vec();
+          return Poll::Ready(Ok(buf.len()));
+        }
+        Poll::Ready(Ok(_)) => return Poll::Ready(Ok(buf.len())),
+        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+        Poll::Pending => {
+          self.pending_write = out;
+          return Poll::Pending;
+        }
+      }
+    }
   }
 
   fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    if !self.pending_write.is_empty() {
+      match self.as_mut().poll_write(cx, &[]) {
+        Poll::Ready(Ok(_)) => {}
+        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+        Poll::Pending => return Poll::Pending,
+      }
+    }
     Pin::new(&mut self.inner).poll_flush(cx)
   }
 
@@ -389,5 +451,43 @@ mod tests {
     let secret = hex::decode("0123456789abcdef0123456789abcdef").expect("secret");
     let noise = vec![0u8; 128];
     assert!(!matches_obfuscated2(&noise, &secret));
+  }
+
+  #[tokio::test]
+  async fn obfuscated_stream_write_all_completes() {
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+
+    let secret = hex::decode("0123456789abcdef0123456789abcdef").expect("secret");
+    let handshake = generate_test_handshake(&secret, 2, PROTO_TAG_SECURE);
+    let (client_io, proxy_io) = duplex(4096);
+    let prefixed = crate::io_util::PrefixedStream::new(handshake.to_vec(), client_io);
+    let mut client_stream = accept_handshake(prefixed, &secret)
+      .await
+      .expect("accept")
+      .stream;
+
+    let payload = vec![0xABu8; 512];
+    let reader = tokio::spawn(async move {
+      let mut proxy_read = proxy_io;
+      let mut total = 0usize;
+      let mut buf = [0u8; 64];
+      loop {
+        match proxy_read.read(&mut buf).await {
+          Ok(0) => break,
+          Ok(n) => total += n,
+          Err(err) => panic!("proxy read: {err}"),
+        }
+      }
+      total
+    });
+
+    client_stream
+      .write_all(&payload)
+      .await
+      .expect("client write");
+    drop(client_stream);
+
+    let total = reader.await.expect("reader join");
+    assert_eq!(total, payload.len());
   }
 }
