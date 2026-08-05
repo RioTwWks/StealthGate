@@ -1,5 +1,6 @@
 use crate::config::{decode_secret, SecretMode, SecretRoute};
 use crate::error::Result;
+use crate::mtproto_obfuscate;
 use crate::tls::{looks_like_tls_client_hello, parse_client_hello, parse_record};
 
 /// Подсказка о формате нераспознанного трафика (для диагностики).
@@ -137,6 +138,20 @@ impl Detector {
       }
     }
 
+    if data.len() >= mtproto_obfuscate::HANDSHAKE_LEN {
+      for route in &self.routes {
+        if mtproto_obfuscate::matches_obfuscated2(data, &route.secret) {
+          return DetectionResult::mtproto(
+            sni.clone(),
+            route.label.clone(),
+            route.mode,
+            route.backend.clone(),
+            route.max_connections,
+          );
+        }
+      }
+    }
+
     if looks_like_tls_client_hello(data) {
       if let Some(ref domain) = sni {
         if self.matches_fake_domain(domain) {
@@ -206,8 +221,8 @@ pub fn classify_peek(data: &[u8]) -> TrafficHint {
 pub fn fallback_diagnostic_message(hint: TrafficHint, has_ee_route: bool) -> Option<&'static str> {
   match hint {
     TrafficHint::ObfuscatedMtproto if has_ee_route => Some(
-      "похоже на обфусцированный MTProto (dd/random), а не ee Fake TLS (ожидается префикс 160301). \
-       Проверьте секрет в Telegram: нужен полный ee-секрет с hex-доменом fake_domain",
+      "обфусцированный MTProto, но секрет не совпал — для Fake TLS нужен полный ee-секрет с hex-доменом fake_domain; \
+       для obfuscated2 — classic/dd-секрет или короткий ee без домена",
     ),
     TrafficHint::TlsClientHello if has_ee_route => Some(
       "TLS ClientHello без совпадения SNI с fake_domain/sni_pool — проверьте домен в ee-секрете Telegram",
@@ -300,6 +315,29 @@ mod tests {
     assert_eq!(result.secret_mode, Some(SecretMode::Ee));
     assert_eq!(result.backend.as_deref(), Some("2.2.2.2:443"));
     assert_eq!(result.max_connections, 10);
+  }
+
+  #[test]
+  fn detects_obfuscated2_handshake() {
+    let secret_hex = "ee0123456789abcdef0123456789abcdef";
+    let secret = decode_secret(secret_hex).expect("bytes");
+    let handshake =
+      mtproto_obfuscate::generate_test_handshake(&secret, 2, [0xdd, 0xdd, 0xdd, 0xdd]);
+    let mut payload = handshake.to_vec();
+    payload.extend_from_slice(&[0xAA; 150]);
+
+    let routes = vec![SecretRoute {
+      label: "default".into(),
+      secret: secret_hex.into(),
+      mode: SecretMode::Ee,
+      backend: "149.154.167.99:443".into(),
+      max_connections: 0,
+    }];
+    let detector =
+      Detector::from_routes(&routes, &["www.cloudflare.com".into()]).expect("detector");
+    let result = detector.detect(&payload);
+    assert_eq!(result.traffic_type, TrafficType::Mtproto);
+    assert_eq!(result.secret_mode, Some(SecretMode::Ee));
   }
 
   #[test]

@@ -14,6 +14,7 @@ pub mod io_util;
 pub mod limits;
 pub mod mcp;
 pub mod metrics;
+pub mod mtproto_obfuscate;
 pub mod network;
 pub mod proxy;
 pub mod split;
