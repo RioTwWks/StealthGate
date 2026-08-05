@@ -498,17 +498,9 @@ where
     let dc_connect = pool.connect(&network, Some(&frame.backend), &state.stats);
   }
 
-  // ACK до завершения connect DC — front сразу начинает relay plaintext obfuscated2.
-  send_ack(&mut front_stream, true, None).await?;
-  state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
-
-  let prefixed = PrefixedStream::new(frame.initial_data, front_stream);
-  let accepted = mtproto_obfuscate::accept_handshake(prefixed, &secret).await?;
-  let relay_dc_id = if accepted.dc_id != 0 {
-    accepted.dc_id
-  } else {
-    mtproto_obfuscate::dc_id_from_backend(&frame.backend)
-  };
+  let relay_dc_id = mtproto_obfuscate::handshake_dc_index(&handshake, &secret)
+    .filter(|&dc| dc != 0)
+    .unwrap_or_else(|| mtproto_obfuscate::dc_id_from_backend(&frame.backend));
 
   let (mut upstream, connected_backend) = match dc_connect.await {
     Ok(value) => value,
@@ -519,6 +511,7 @@ where
         error = %err,
         "split back ee: не удалось подключиться к Telegram DC"
       );
+      send_ack(&mut front_stream, false, Some(&err.to_string())).await?;
       return Err(err);
     }
   };
@@ -536,6 +529,20 @@ where
     .write_all(&header)
     .await
     .map_err(|err| StealthGateError::Proxy(format!("split ee relay header to DC: {err}")))?;
+
+  tracing::debug!(
+    %peer_ip,
+    relay_dc_id,
+    backend = %connected_backend,
+    "split back ee: relay init отправлен в DC, отдаём ACK front"
+  );
+
+  // ACK только после relay init — DC готов принимать клиентские данные.
+  send_ack(&mut front_stream, true, None).await?;
+  state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
+
+  let prefixed = PrefixedStream::new(frame.initial_data, front_stream);
+  let accepted = mtproto_obfuscate::accept_handshake(prefixed, &secret).await?;
   let dc_stream = ObfuscatedStream::from_relay_keys(upstream, relay_keys);
   let (c2b, b2c) = proxy::copy_bidirectional(accepted.stream, dc_stream).await?;
   state

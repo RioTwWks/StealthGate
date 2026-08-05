@@ -73,6 +73,32 @@ pub fn parse_handshake(handshake: &[u8; HANDSHAKE_LEN], secret: &[u8]) -> Option
   })
 }
 
+/// Возвращает подписанный DC index из obfuscated2 handshake (для relay init к Telegram).
+pub fn handshake_dc_index(handshake: &[u8; HANDSHAKE_LEN], secret: &[u8]) -> Option<i16> {
+  if secret.len() != 16 {
+    return None;
+  }
+
+  let prekey = &handshake[SKIP_LEN..SKIP_LEN + PREKEY_LEN];
+  let iv = &handshake[SKIP_LEN + PREKEY_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN];
+  let key = {
+    let mut h = Sha256::new();
+    h.update(prekey);
+    h.update(secret);
+    h.finalize()
+  };
+
+  let mut buf = *handshake;
+  let mut cipher = make_cipher(&key, iv);
+  cipher.apply_keystream(&mut buf);
+
+  if !is_valid_proto_tag(&buf[PROTO_TAG_POS..PROTO_TAG_POS + 4]) {
+    return None;
+  }
+
+  Some(i16::from_le_bytes([buf[DC_IDX_POS], buf[DC_IDX_POS + 1]]))
+}
+
 fn is_valid_proto_tag(tag: &[u8]) -> bool {
   tag == PROTO_TAG_ABRIDGED || tag == PROTO_TAG_INTERMEDIATE || tag == PROTO_TAG_SECURE
 }
@@ -427,6 +453,7 @@ mod tests {
     let info = parse_handshake(&handshake, &secret).expect("handshake");
     assert_eq!(info.dc_id, 2);
     assert!(!info.is_media);
+    assert_eq!(handshake_dc_index(&handshake, &secret), Some(2));
   }
 
   #[test]
