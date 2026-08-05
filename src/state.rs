@@ -229,7 +229,7 @@ impl AppState {
 
   /// Обновляет MTProto-секрет в памяти и на диске.
   pub fn update_secret(&self, secret: String) -> Result<()> {
-    crate::config::decode_secret(&secret)?;
+    crate::config::validate_secret(&secret)?;
     {
       let mut config = self
         .config
@@ -253,7 +253,7 @@ impl AppState {
     backend: String,
     fake_domain: String,
   ) -> Result<()> {
-    crate::config::decode_secret(&secret)?;
+    crate::config::validate_secret(&secret)?;
     {
       let mut config = self
         .config
@@ -276,9 +276,9 @@ impl AppState {
 
   /// Обновляет только MTProto-секцию (admin API).
   pub fn update_mtproto(&self, mtproto: MtprotoConfig) -> Result<()> {
-    crate::config::decode_secret(&mtproto.secret)?;
+    crate::config::validate_secret(&mtproto.secret)?;
     for entry in &mtproto.secrets {
-      crate::config::decode_secret(&entry.secret)?;
+      crate::config::validate_secret(&entry.secret)?;
     }
     {
       let mut config = self
@@ -312,7 +312,9 @@ impl AppState {
       .map_err(|_| StealthGateError::Config("блокировка config poisoned".into()))?;
     Ok(format!(
       "tg://proxy?server={}&port={}&secret={}",
-      config.listen.host, config.listen.port, config.mtproto.secret
+      config.listen.host,
+      config.listen.port,
+      crate::config::telegram_proxy_secret(&config.mtproto.secret, &config.tls.fake_domain)?
     ))
   }
 

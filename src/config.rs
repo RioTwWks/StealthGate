@@ -636,9 +636,9 @@ impl Config {
 
   /// Валидирует конфигурацию.
   pub fn validate(&self) -> Result<()> {
-    decode_secret(&self.mtproto.secret)?;
+    validate_secret(&self.mtproto.secret)?;
     for entry in &self.mtproto.secrets {
-      decode_secret(&entry.secret)?;
+      validate_secret(&entry.secret)?;
       if entry.label.trim().is_empty() {
         return Err(StealthGateError::Config(
           "mtproto.secrets[].label не может быть пустым".into(),
@@ -825,22 +825,114 @@ pub fn is_protocol_allowed(secret: &str, allowed: &[String]) -> bool {
   allowed.iter().any(|value| value.eq_ignore_ascii_case(mode_name))
 }
 
-/// Декодирует hex-секрет MTProto.
+/// Декодирует hex-секрет MTProto (только 16-байтное ядро).
 pub fn decode_secret(secret: &str) -> Result<Vec<u8>> {
+  let core_hex = secret_core_hex(secret)?;
+  hex::decode(&core_hex)
+    .map_err(|err| StealthGateError::Config(format!("некорректный hex-секрет: {err}")))
+}
+
+/// Возвращает 32-символьное hex-ядро секрета (без префикса dd/ee и домена).
+pub fn secret_core_hex(secret: &str) -> Result<String> {
+  let hex_part = secret_hex_payload(secret)?;
+  if hex_part.len() < 32 {
+    return Err(StealthGateError::Config(
+      "секрет должен содержать минимум 16 байт в hex (32 символа)".into(),
+    ));
+  }
+
+  let core = &hex_part[..32];
+  if !core.chars().all(|ch| ch.is_ascii_hexdigit()) {
+    return Err(StealthGateError::Config(
+      "ядро секрета должно быть hex (32 символа)".into(),
+    ));
+  }
+
+  Ok(core.to_string())
+}
+
+/// Hex-часть секрета после префикса dd/ee (ядро + опциональный домен).
+pub fn secret_hex_payload(secret: &str) -> Result<String> {
   let normalized = secret.trim().to_ascii_lowercase();
   let hex_part = normalized
     .strip_prefix("dd")
     .or_else(|| normalized.strip_prefix("ee"))
-    .unwrap_or(&normalized);
+    .unwrap_or(&normalized)
+    .to_string();
 
-  if hex_part.len() != 32 || !hex_part.chars().all(|ch| ch.is_ascii_hexdigit()) {
+  if hex_part.is_empty() {
+    return Err(StealthGateError::Config("секрет не может быть пустым".into()));
+  }
+
+  if !hex_part.chars().all(|ch| ch.is_ascii_hexdigit()) {
     return Err(StealthGateError::Config(
-      "секрет должен быть 16 байт в hex (32 символа), опционально с префиксом dd/ee".into(),
+      "секрет должен состоять из hex-символов (опционально с префиксом dd/ee)".into(),
     ));
   }
 
-  hex::decode(hex_part)
-    .map_err(|err| StealthGateError::Config(format!("некорректный hex-секрет: {err}")))
+  Ok(hex_part)
+}
+
+/// Домен, вшитый в ee-секрет (hex-суффикс после 32 символов ядра).
+pub fn secret_embedded_domain(secret: &str) -> Option<String> {
+  let hex_part = secret_hex_payload(secret).ok()?;
+  if !secret.trim().to_ascii_lowercase().starts_with("ee") || hex_part.len() <= 32 {
+    return None;
+  }
+  let domain_hex = &hex_part[32..];
+  let bytes = hex::decode(domain_hex).ok()?;
+  String::from_utf8(bytes).ok()
+}
+
+/// Полный ee-секрет для Telegram: ee + ядро + hex(domain).
+pub fn format_ee_secret(core_hex: &str, domain: &str) -> Result<String> {
+  let core = core_hex.trim().to_ascii_lowercase();
+  if core.len() != 32 || !core.chars().all(|ch| ch.is_ascii_hexdigit()) {
+    return Err(StealthGateError::Config(
+      "ядро ee-секрета должно быть 32 hex-символа".into(),
+    ));
+  }
+  let domain = domain.trim();
+  if domain.is_empty() {
+    return Err(StealthGateError::Config(
+      "домен для ee-секрета не может быть пустым".into(),
+    ));
+  }
+  Ok(format!("ee{core}{}", hex::encode(domain.as_bytes())))
+}
+
+/// Секрет для tg://proxy: дополняет ee-ядро доменом из fake_domain при необходимости.
+pub fn telegram_proxy_secret(secret: &str, fake_domain: &str) -> Result<String> {
+  let normalized = secret.trim().to_ascii_lowercase();
+  if normalized.starts_with("ee") {
+    if secret_embedded_domain(secret).is_some() {
+      return Ok(secret.trim().to_string());
+    }
+    let core = secret_core_hex(secret)?;
+    return format_ee_secret(&core, fake_domain);
+  }
+  Ok(secret.trim().to_string())
+}
+
+/// Валидирует полный секрет Telegram (classic / dd / ee с доменом).
+pub fn validate_secret(secret: &str) -> Result<()> {
+  let normalized = secret.trim().to_ascii_lowercase();
+  if normalized.is_empty() {
+    return Err(StealthGateError::Config("секрет не может быть пустым".into()));
+  }
+
+  if normalized.starts_with("dd") || normalized.starts_with("ee") {
+    secret_core_hex(secret)?;
+    return Ok(());
+  }
+
+  let hex_part = secret_hex_payload(secret)?;
+  if hex_part.len() != 32 {
+    return Err(StealthGateError::Config(
+      "classic-секрет должен быть ровно 32 hex-символа (16 байт)".into(),
+    ));
+  }
+  Ok(())
 }
 
 #[cfg(test)]
@@ -851,6 +943,28 @@ mod tests {
   fn decode_secret_with_ee_prefix() {
     let bytes = decode_secret("ee0123456789abcdef0123456789abcdef").expect("декодирование");
     assert_eq!(bytes.len(), 16);
+  }
+
+  #[test]
+  fn decode_secret_with_ee_domain_suffix() {
+    let full = "ee0123456789abcdef0123456789abcdef7777772e636c6f7564666c6172652e636f6d";
+    let bytes = decode_secret(full).expect("декодирование");
+    assert_eq!(bytes.len(), 16);
+    assert!(validate_secret(full).is_ok());
+    assert_eq!(
+      secret_embedded_domain(full).as_deref(),
+      Some("www.cloudflare.com")
+    );
+  }
+
+  #[test]
+  fn telegram_proxy_secret_appends_domain_for_ee_core() {
+    let secret = telegram_proxy_secret(
+      "ee0123456789abcdef0123456789abcdef",
+      "www.cloudflare.com",
+    )
+    .expect("secret");
+    assert!(secret.contains("7777772e636c6f7564666c6172652e636f6d"));
   }
 
   #[test]
