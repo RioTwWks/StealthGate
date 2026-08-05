@@ -68,6 +68,14 @@ pub async fn handle_connection(mut client: TcpStream, state: Arc<AppState>) -> R
     ctx.ja4_enforce,
   )?;
 
+  tracing::debug!(
+    traffic = ?detection.traffic_type,
+    sni = ?detection.sni,
+    peek_len = peek_buf.len(),
+    peek_prefix = %hex::encode(&peek_buf[..peek_buf.len().min(8)]),
+    "детекция входящего соединения"
+  );
+
   if detection.traffic_type == TrafficType::Mtproto {
     let label = detection.secret_label.as_deref().unwrap_or("default");
     state.limits.acquire(

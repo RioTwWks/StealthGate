@@ -164,6 +164,13 @@ where
   for back_addr in &split.back_servers {
     match tokio::time::timeout(timeout, TcpStream::connect(back_addr)).await {
       Ok(Ok(mut back_stream)) => {
+        tracing::info!(
+          back = %back_addr,
+          secret_mode = ?secret_mode,
+          backend = %preferred_backend,
+          frame_bytes = frame.len(),
+          "split front: отправка SGFB opening-кадра на back"
+        );
         if let Err(err) = back_stream.write_all(&frame).await {
           last_error = Some(StealthGateError::Proxy(format!(
             "split write к {back_addr}: {err}"
@@ -239,6 +246,10 @@ async fn read_opening_frame(
     .map_err(|err| StealthGateError::Proxy(format!("split opening header: {err}")))?;
 
   if header[0..4] != *MAGIC {
+    tracing::warn!(
+      peer_prefix = %hex::encode(&header[..header.len().min(16)]),
+      "split back: ожидался SGFB, получены другие байты (возможен прямой TLS/HTTP или port-forward без SGFB)"
+    );
     return Err(StealthGateError::Proxy("неверный split magic".into()));
   }
 
