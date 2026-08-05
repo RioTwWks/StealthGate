@@ -384,11 +384,20 @@ impl Default for SecurityConfig {
 }
 
 /// Сетевые настройки исходящих соединений.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
   pub socks5_proxy: Option<String>,
   #[serde(default = "default_backend_timeout")]
   pub backend_timeout_secs: u64,
+}
+
+impl Default for NetworkConfig {
+  fn default() -> Self {
+    Self {
+      socks5_proxy: None,
+      backend_timeout_secs: default_backend_timeout(),
+    }
+  }
 }
 
 fn default_backend_timeout() -> u64 {
@@ -703,6 +712,11 @@ impl Config {
 
     self.split.validate()?;
     self.tls.validate()?;
+    if self.network.backend_timeout_secs == 0 {
+      return Err(StealthGateError::Config(
+        "network.backend_timeout_secs должен быть > 0 (рекомендуется 15–30)".into(),
+      ));
+    }
 
     Ok(())
   }
@@ -965,6 +979,33 @@ mod tests {
     )
     .expect("secret");
     assert!(secret.contains("7777772e636c6f7564666c6172652e636f6d"));
+  }
+
+  #[test]
+  fn network_config_default_timeout_is_nonzero() {
+    let network = NetworkConfig::default();
+    assert_eq!(network.backend_timeout_secs, 30);
+  }
+
+  #[test]
+  fn config_without_network_section_uses_safe_timeout() {
+    let toml = r#"
+[listen]
+host = "127.0.0.1"
+port = 443
+
+[tls]
+fake_domain = "example.com"
+
+[mtproto]
+secret = "0123456789abcdef0123456789abcdef"
+backend = "149.154.167.99:443"
+
+[fallback]
+"#;
+    let config: Config = toml::from_str(toml).expect("parse");
+    assert_eq!(config.network.backend_timeout_secs, 30);
+    assert!(config.validate().is_ok());
   }
 
   #[test]

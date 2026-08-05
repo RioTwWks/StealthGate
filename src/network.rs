@@ -8,12 +8,13 @@ use crate::error::{Result, StealthGateError};
 
 /// Подключается к backend напрямую или через SOCKS5.
 pub async fn connect_backend(backend: &str, network: &NetworkConfig) -> Result<TcpStream> {
+  let timeout_secs = network.backend_timeout_secs.max(1);
   if let Some(proxy) = &network.socks5_proxy {
-    return socks5_connect(proxy, backend, network.backend_timeout_secs).await;
+    return socks5_connect(proxy, backend, timeout_secs).await;
   }
 
   let stream = tokio::time::timeout(
-    Duration::from_secs(network.backend_timeout_secs),
+    Duration::from_secs(timeout_secs),
     TcpStream::connect(backend),
   )
   .await
