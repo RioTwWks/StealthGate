@@ -228,6 +228,7 @@ async fn handle_mtproto(
       peek_buf,
       backend,
       secret_mode,
+      detection.secret_label.as_deref(),
       &split_cfg,
       state,
     )

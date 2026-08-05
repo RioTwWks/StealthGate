@@ -1,12 +1,17 @@
-//! Распознавание 64-байтного obfuscated2 handshake MTProto-прокси.
+//! Распознавание и генерация 64-байтного obfuscated2 handshake MTProto-прокси.
 //!
 //! Клиент отправляет 64 случайных байта; байты [8..40] — prekey, [40..56] — IV.
 //! Ключ: `SHA-256(prekey || secret)`. После AES-256-CTR в [56..60] — тег протокола.
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use aes::Aes256;
 use cipher::{KeyIvInit, StreamCipher};
 use ctr::Ctr128BE;
+use rand::RngCore;
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub const HANDSHAKE_LEN: usize = 64;
 const SKIP_LEN: usize = 8;
@@ -76,10 +81,246 @@ fn make_cipher(key: &[u8], iv: &[u8]) -> AesCtr256 {
   AesCtr256::new_from_slices(key, iv).expect("AES-256-CTR key/iv length")
 }
 
+/// Производный AES-CTR ключ для obfuscated2 с секретом прокси.
+pub fn derive_key_with_secret(prekey: &[u8], secret: &[u8]) -> [u8; 32] {
+  let mut h = Sha256::new();
+  h.update(prekey);
+  h.update(secret);
+  h.finalize().into()
+}
+
+/// Результат приёма obfuscated2 handshake от клиента.
+pub struct AcceptedHandshake<S> {
+  pub stream: ObfuscatedStream<S>,
+  pub dc_id: i16,
+}
+
+/// Принимает 64-байтный obfuscated2 handshake из потока (например, внутри Fake TLS).
+pub async fn accept_handshake<S>(
+  mut reader: S,
+  secret: &[u8],
+) -> crate::error::Result<AcceptedHandshake<S>>
+where
+  S: AsyncRead + Unpin,
+{
+  let mut header = [0u8; HANDSHAKE_LEN];
+  reader
+    .read_exact_obfuscated_header(&mut header)
+    .await?;
+
+  let info = parse_handshake(&header, secret).ok_or_else(|| {
+    crate::error::StealthGateError::Proxy(
+      "невалидный obfuscated2 handshake от клиента".into(),
+    )
+  })?;
+
+  let mut reversed = [0u8; HANDSHAKE_LEN];
+  for i in 0..HANDSHAKE_LEN {
+    reversed[i] = header[HANDSHAKE_LEN - 1 - i];
+  }
+
+  let dec_key = derive_key_with_secret(&header[SKIP_LEN..SKIP_LEN + PREKEY_LEN], secret);
+  let dec_iv: [u8; 16] = header[SKIP_LEN + PREKEY_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN]
+    .try_into()
+    .expect("iv len");
+  let mut dec = make_cipher(&dec_key, &dec_iv);
+  let mut sink = header;
+  dec.apply_keystream(&mut sink);
+  let dc_idx = i16::from_le_bytes([sink[DC_IDX_POS], sink[DC_IDX_POS + 1]]);
+
+  let _ = info;
+
+  let enc_key = derive_key_with_secret(&reversed[SKIP_LEN..SKIP_LEN + PREKEY_LEN], secret);
+  let enc_iv: [u8; 16] = reversed[SKIP_LEN + PREKEY_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN]
+    .try_into()
+    .expect("iv len");
+  let enc = make_cipher(&enc_key, &enc_iv);
+
+  Ok(AcceptedHandshake {
+    stream: ObfuscatedStream {
+      inner: reader,
+      enc,
+      dec,
+    },
+    dc_id: dc_idx,
+  })
+}
+
+trait ReadExactHeader {
+  async fn read_exact_obfuscated_header(&mut self, buf: &mut [u8; HANDSHAKE_LEN]) -> crate::error::Result<()>;
+}
+
+impl<S> ReadExactHeader for S
+where
+  S: AsyncRead + Unpin,
+{
+  async fn read_exact_obfuscated_header(
+    &mut self,
+    buf: &mut [u8; HANDSHAKE_LEN],
+  ) -> crate::error::Result<()> {
+    use tokio::io::AsyncReadExt;
+    self
+      .read_exact(buf)
+      .await
+      .map(|_| ())
+      .map_err(|err| crate::error::StealthGateError::Proxy(format!("obfuscated2 header: {err}")))
+  }
+}
+
+/// Генерирует исходящий 64-байтный handshake для подключения к Telegram DC (без секрета).
+pub fn generate_relay_init(dc_id: i16) -> crate::error::Result<([u8; HANDSHAKE_LEN], RelayKeys)> {
+  let proto_tag = PROTO_TAG_SECURE;
+  let dc_bytes = dc_id.to_le_bytes();
+
+  loop {
+    let mut raw = [0u8; HANDSHAKE_LEN];
+    rand::thread_rng().fill_bytes(&mut raw);
+
+    if RESERVED_FIRST_BYTES.contains(&raw[0]) {
+      continue;
+    }
+    if RESERVED_STARTS.iter().any(|s| &raw[..4] == s) {
+      continue;
+    }
+    if raw[4..8] == RESERVED_CONTINUE {
+      continue;
+    }
+
+    let enc_key: [u8; PREKEY_LEN] = raw[SKIP_LEN..SKIP_LEN + PREKEY_LEN]
+      .try_into()
+      .expect("enc key");
+    let enc_iv: [u8; IV_LEN] = raw[SKIP_LEN + PREKEY_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN]
+      .try_into()
+      .expect("enc iv");
+
+    let mut reversed = [0u8; HANDSHAKE_LEN];
+    for i in 0..HANDSHAKE_LEN {
+      reversed[i] = raw[HANDSHAKE_LEN - 1 - i];
+    }
+    let dec_key: [u8; PREKEY_LEN] = reversed[SKIP_LEN..SKIP_LEN + PREKEY_LEN]
+      .try_into()
+      .expect("dec key");
+    let dec_iv: [u8; IV_LEN] =
+      reversed[SKIP_LEN + PREKEY_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN]
+        .try_into()
+        .expect("dec iv");
+
+    let mut enc = make_cipher(&enc_key, &enc_iv);
+    let mut plaintext = raw;
+    plaintext[PROTO_TAG_POS..PROTO_TAG_POS + 4].copy_from_slice(&proto_tag);
+    plaintext[DC_IDX_POS..DC_IDX_POS + 2].copy_from_slice(&dc_bytes);
+
+    let mut encrypted = plaintext;
+    enc.apply_keystream(&mut encrypted);
+    let mut header = raw;
+    header[PROTO_TAG_POS..].copy_from_slice(&encrypted[PROTO_TAG_POS..]);
+
+    let dec = make_cipher(&dec_key, &dec_iv);
+    return Ok((
+      header,
+      RelayKeys {
+        enc,
+        dec,
+      },
+    ));
+  }
+}
+
+/// AES-CTR ключи для relay-соединения с Telegram DC.
+pub struct RelayKeys {
+  pub enc: AesCtr256,
+  pub dec: AesCtr256,
+}
+
+/// Оборачивает поток AES-256-CTR шифрованием obfuscated2.
+pub struct ObfuscatedStream<S> {
+  inner: S,
+  enc: AesCtr256,
+  dec: AesCtr256,
+}
+
+impl<S> ObfuscatedStream<S> {
+  pub fn from_relay_keys(inner: S, keys: RelayKeys) -> Self {
+    Self {
+      inner,
+      enc: keys.enc,
+      dec: keys.dec,
+    }
+  }
+
+  pub fn into_inner(self) -> S {
+    self.inner
+  }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for ObfuscatedStream<S> {
+  fn poll_read(
+    mut self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    buf: &mut ReadBuf<'_>,
+  ) -> Poll<std::io::Result<()>> {
+    let filled_before = buf.filled().len();
+    let inner = Pin::new(&mut self.inner);
+    match inner.poll_read(cx, buf) {
+      Poll::Ready(Ok(())) => {
+        let filled = buf.filled_mut();
+        let n = filled.len() - filled_before;
+        if n > 0 {
+          self.dec.apply_keystream(&mut filled[filled_before..]);
+        }
+        Poll::Ready(Ok(()))
+      }
+      other => other,
+    }
+  }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for ObfuscatedStream<S> {
+  fn poll_write(
+    mut self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    buf: &[u8],
+  ) -> Poll<std::io::Result<usize>> {
+    let mut out = buf.to_vec();
+    self.enc.apply_keystream(&mut out);
+    Pin::new(&mut self.inner).poll_write(cx, &out)
+  }
+
+  fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    Pin::new(&mut self.inner).poll_flush(cx)
+  }
+
+  fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    Pin::new(&mut self.inner).poll_shutdown(cx)
+  }
+}
+
+/// Оценивает DC id по адресу backend (fallback).
+pub fn dc_id_from_backend(backend: &str) -> i16 {
+  let host = backend.split(':').next().unwrap_or(backend);
+  match host {
+    "149.154.175.50" => 4,
+    "149.154.167.51" => 3,
+    "149.154.175.100" => 1,
+    "149.154.167.99" | "149.154.167.40" => 2,
+    "91.108.56.100" => 5,
+    _ => 2,
+  }
+}
+
+const RESERVED_FIRST_BYTES: &[u8] = &[0xef];
+const RESERVED_STARTS: &[[u8; 4]] = &[
+  [0x48, 0x45, 0x41, 0x44],
+  [0x50, 0x4f, 0x53, 0x54],
+  [0x47, 0x45, 0x54, 0x20],
+  [0xee, 0xee, 0xee, 0xee],
+  [0xdd, 0xdd, 0xdd, 0xdd],
+  [0x16, 0x03, 0x01, 0x02],
+];
+const RESERVED_CONTINUE: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
+
 #[cfg(test)]
 pub fn generate_test_handshake(secret: &[u8], dc_idx: i16, proto_tag: [u8; 4]) -> [u8; HANDSHAKE_LEN] {
-  use rand::RngCore;
-
   let dc_bytes = dc_idx.to_le_bytes();
   loop {
     let mut raw = [0u8; HANDSHAKE_LEN];
@@ -95,12 +336,7 @@ pub fn generate_test_handshake(secret: &[u8], dc_idx: i16, proto_tag: [u8; 4]) -
       continue;
     }
 
-    let key = {
-      let mut h = Sha256::new();
-      h.update(&raw[SKIP_LEN..SKIP_LEN + PREKEY_LEN]);
-      h.update(secret);
-      h.finalize()
-    };
+    let key = derive_key_with_secret(&raw[SKIP_LEN..SKIP_LEN + PREKEY_LEN], secret);
     let iv = &raw[SKIP_LEN + PREKEY_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN];
 
     let mut keystream = [0u8; HANDSHAKE_LEN];
@@ -117,20 +353,6 @@ pub fn generate_test_handshake(secret: &[u8], dc_idx: i16, proto_tag: [u8; 4]) -
     return handshake;
   }
 }
-
-#[cfg(test)]
-const RESERVED_FIRST_BYTES: &[u8] = &[0xef];
-#[cfg(test)]
-const RESERVED_STARTS: &[[u8; 4]] = &[
-  [0x48, 0x45, 0x41, 0x44],
-  [0x50, 0x4f, 0x53, 0x54],
-  [0x47, 0x45, 0x54, 0x20],
-  [0xee, 0xee, 0xee, 0xee],
-  [0xdd, 0xdd, 0xdd, 0xdd],
-  [0x16, 0x03, 0x01, 0x02],
-];
-#[cfg(test)]
-const RESERVED_CONTINUE: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
 
 #[cfg(test)]
 mod tests {

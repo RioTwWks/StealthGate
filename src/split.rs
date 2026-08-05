@@ -136,16 +136,28 @@ fn byte_to_secret_mode(value: u8) -> Result<SecretMode> {
 
 /// Front: проксирует MTProto-сессию на back-узел.
 pub async fn relay_from_front<C>(
-  client: C,
+  mut client: C,
   initial_data: &[u8],
   preferred_backend: &str,
   secret_mode: SecretMode,
+  secret_label: Option<&str>,
   split: &SplitConfig,
   state: &AppState,
 ) -> Result<()>
 where
   C: AsyncRead + AsyncWrite + Unpin,
 {
+  if secret_mode == SecretMode::Ee {
+    let secret = proxy::resolve_secret_bytes(state, secret_label)?;
+    let client_hello = crate::faketls::parse_client_hello_record(initial_data)?;
+    crate::faketls::validate_client_hello(&client_hello, &secret)?;
+    crate::faketls::send_server_hello(&mut client, &client_hello, &secret).await?;
+    tracing::debug!(
+      sni = ?client_hello.sni,
+      "split front: отправлен fake TLS ServerHello клиенту"
+    );
+  }
+
   let token = split
     .auth_token
     .as_deref()
@@ -447,6 +459,23 @@ where
         "connected": connected_backend,
       })),
     );
+  }
+
+  if frame.secret_mode == SecretMode::Ee {
+    let secret = proxy::resolve_secret_bytes(state, None)?;
+    send_ack(&mut front_stream, true, None).await?;
+    state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
+    let (c2b, b2c) = proxy::relay_ee_streams(front_stream, upstream, &secret, &frame.backend).await?;
+    state.stats.bytes_to_backend.fetch_add(c2b, Ordering::Relaxed);
+    state.stats.bytes_from_backend.fetch_add(b2c, Ordering::Relaxed);
+    tracing::debug!(
+      backend = %connected_backend,
+      peer = %peer_ip,
+      c2b,
+      b2c,
+      "split back ee-сессия завершена"
+    );
+    return Ok(());
   }
 
   if let Err(err) = proxy::write_initial_to_backend(

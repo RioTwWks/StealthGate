@@ -1,13 +1,17 @@
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use crate::config::{
-  DdConfig, DrsConfig, FragmentationConfig, NetworkConfig, SecretMode, WebhooksConfig,
+  decode_secret, DdConfig, DrsConfig, FragmentationConfig, NetworkConfig, SecretMode,
+  WebhooksConfig,
 };
 use crate::dd_protocol;
 use crate::drs;
-use crate::error::Result;
+use crate::error::{Result, StealthGateError};
+use crate::faketls::{self, FakeTlsStream};
 use crate::fragmentation;
+use crate::mtproto_obfuscate::{self, ObfuscatedStream};
 use crate::state::AppState;
 use crate::webhooks::{dispatch, WebhookEvent};
 
@@ -29,6 +33,10 @@ pub async fn proxy_mtproto(
   state: &AppState,
   options: &MtprotoProxyOptions<'_>,
 ) -> Result<()> {
+  if options.secret_mode == SecretMode::Ee {
+    return proxy_mtproto_ee(client, initial_data, state, options).await;
+  }
+
   let pool = state
     .backend_pool
     .read()
@@ -86,6 +94,112 @@ pub async fn proxy_mtproto(
   );
 
   Ok(())
+}
+
+/// Проксирует ee Fake TLS: ServerHello клиенту, obfuscated2 к Telegram DC.
+pub async fn proxy_mtproto_ee(
+  mut client: TcpStream,
+  initial_data: &[u8],
+  state: &AppState,
+  options: &MtprotoProxyOptions<'_>,
+) -> Result<()> {
+  let secret = resolve_secret_bytes(state, None)?;
+
+  let client_hello = faketls::parse_client_hello_record(initial_data)?;
+  faketls::validate_client_hello(&client_hello, &secret)?;
+  faketls::send_server_hello(&mut client, &client_hello, &secret).await?;
+
+  let pool = state
+    .backend_pool
+    .read()
+    .map_err(|_| StealthGateError::Config("блокировка backend_pool poisoned".into()))?
+    .clone();
+  let (upstream, connected_backend) = pool
+    .connect(options.network, Some(options.preferred_backend), &state.stats)
+    .await?;
+
+  if connected_backend != options.preferred_backend {
+    dispatch(
+      options.webhooks,
+      WebhookEvent::BackendFailover,
+      Some(serde_json::json!({
+        "preferred": options.preferred_backend,
+        "connected": connected_backend,
+      })),
+    );
+  }
+
+  let (c2s, s2c) = relay_ee_streams(
+    FakeTlsStream::new(client),
+    upstream,
+    &secret,
+    options.preferred_backend,
+  )
+  .await?;
+
+  state
+    .stats
+    .bytes_to_backend
+    .fetch_add(c2s + initial_data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+  state
+    .stats
+    .bytes_from_backend
+    .fetch_add(s2c, std::sync::atomic::Ordering::Relaxed);
+
+  tracing::debug!(
+    backend = %connected_backend,
+    client_to_upstream = c2s,
+    upstream_to_client = s2c,
+    secret_mode = ?options.secret_mode,
+    "ee MTProto-сессия завершена"
+  );
+
+  Ok(())
+}
+
+/// Мост ee Fake TLS (front/back) ↔ obfuscated2 Telegram DC.
+pub async fn relay_ee_streams<C, U>(
+  client_io: C,
+  mut upstream: U,
+  secret: &[u8],
+  preferred_backend: &str,
+) -> Result<(u64, u64)>
+where
+  C: AsyncRead + AsyncWrite + Unpin,
+  U: AsyncRead + AsyncWrite + Unpin,
+{
+  let accepted = mtproto_obfuscate::accept_handshake(client_io, secret).await?;
+  let dc_id = if accepted.dc_id != 0 {
+    accepted.dc_id
+  } else {
+    mtproto_obfuscate::dc_id_from_backend(preferred_backend)
+  };
+
+  let (header, relay_keys) = mtproto_obfuscate::generate_relay_init(dc_id)?;
+  upstream
+    .write_all(&header)
+    .await
+    .map_err(|err| StealthGateError::Proxy(format!("ee relay header to DC: {err}")))?;
+
+  let dc_stream = ObfuscatedStream::from_relay_keys(upstream, relay_keys);
+  copy_bidirectional(accepted.stream, dc_stream).await
+}
+
+pub(crate) fn resolve_secret_bytes(state: &AppState, label: Option<&str>) -> Result<Vec<u8>> {
+  let routes = {
+    let config = state
+      .config
+      .read()
+      .map_err(|_| StealthGateError::Config("блокировка config poisoned".into()))?;
+    config.mtproto.all_secrets()
+  };
+
+  let route = label
+    .and_then(|name| routes.iter().find(|route| route.label == name))
+    .or(routes.first())
+    .ok_or_else(|| StealthGateError::Config("не задан MTProto-секрет".into()))?;
+
+  decode_secret(&route.secret)
 }
 
 /// Записывает начальный пакет с учётом режима секрета и DRS.

@@ -2003,6 +2003,7 @@ dependencies = [
  "clap",
  "ctr",
  "hex",
+ "hmac",
  "qrcode",
  "rand 0.8.6",
  "rcgen",

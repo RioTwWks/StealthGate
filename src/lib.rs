@@ -8,6 +8,7 @@ pub mod drs;
 pub mod detector;
 pub mod domain_fronting;
 pub mod error;
+pub mod faketls;
 pub mod fallback;
 pub mod fragmentation;
 pub mod io_util;
