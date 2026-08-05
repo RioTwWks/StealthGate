@@ -12,6 +12,8 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::config::{SecretMode, SplitConfig, SplitMode};
 use crate::error::{Result, StealthGateError};
 use crate::faketls::FakeTlsStream;
+use crate::io_util::PrefixedStream;
+use crate::mtproto_obfuscate::{self, ObfuscatedStream};
 use crate::proxy;
 use crate::state::AppState;
 
@@ -148,29 +150,45 @@ pub async fn relay_from_front<C>(
 where
   C: AsyncRead + AsyncWrite + Unpin,
 {
-  // Для ee: ClientHello уже обработан на front; в SGFB уходит только хвост TLS
-  // (если клиент отправил Application Data вместе с ClientHello). Дальше — сырой
-  // TLS-трафик клиента, который back разбирает через FakeTlsStream.
-  let ee_tls_tail = if secret_mode == SecretMode::Ee {
+  // Для ee: TLS завершается на front — в SGFB уходит 64-байтный obfuscated2 handshake,
+  // дальше между front и back идёт уже plaintext obfuscated2 (без TLS-обёртки).
+  enum EeRelayClient<C> {
+    Plain(C),
+    Tls(FakeTlsStream<PrefixedStream<C>>),
+  }
+
+  let (sgfb_initial, ee_client) = if secret_mode == SecretMode::Ee {
     let secret = proxy::resolve_secret_bytes(state, secret_label)?;
     let client_hello = crate::faketls::parse_client_hello_record(initial_data)?;
     crate::faketls::validate_client_hello(&client_hello, &secret)?;
     crate::faketls::send_server_hello(&mut client, &client_hello, &secret).await?;
-    let tail = initial_data[client_hello.raw.len()..].to_vec();
+    let tls_tail = initial_data[client_hello.raw.len()..].to_vec();
     tracing::debug!(
       sni = ?client_hello.sni,
-      tls_tail_bytes = tail.len(),
+      tls_tail_bytes = tls_tail.len(),
       "split front: отправлен fake TLS ServerHello клиенту"
     );
-    tail
-  } else {
-    Vec::new()
-  };
 
-  let sgfb_initial: &[u8] = if secret_mode == SecretMode::Ee {
-    &[]
+    let mut tls_io = FakeTlsStream::new(PrefixedStream::new(tls_tail, client));
+    let mut handshake = [0u8; mtproto_obfuscate::HANDSHAKE_LEN];
+    tls_io
+      .read_exact(&mut handshake)
+      .await
+      .map_err(|err| StealthGateError::Proxy(format!("split front ee handshake: {err}")))?;
+    mtproto_obfuscate::parse_handshake(&handshake, &secret).ok_or_else(|| {
+      StealthGateError::Proxy("split front: невалидный obfuscated2 handshake".into())
+    })?;
+    tracing::debug!(
+      handshake_bytes = handshake.len(),
+      "split front: прочитан obfuscated2 handshake, передаём в SGFB initial_data"
+    );
+
+    (handshake.to_vec(), EeRelayClient::Tls(tls_io))
   } else {
-    initial_data
+    (
+      initial_data.to_vec(),
+      EeRelayClient::Plain(client),
+    )
   };
 
   let token = split
@@ -184,7 +202,7 @@ where
     ));
   }
 
-  let frame = encode_opening_frame(token, secret_mode, preferred_backend, sgfb_initial)?;
+  let frame = encode_opening_frame(token, secret_mode, preferred_backend, &sgfb_initial)?;
   let timeout = Duration::from_secs(split.connect_timeout_secs);
   let mut last_error = None;
 
@@ -209,19 +227,18 @@ where
         match tokio::time::timeout(timeout, back_stream.read_exact(&mut ack)).await {
           Ok(Ok(_)) if ack[0] == ACK_OK => {
             state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
-            if !ee_tls_tail.is_empty() {
-              back_stream
-                .write_all(&ee_tls_tail)
-                .await
-                .map_err(|err| StealthGateError::Proxy(format!(
-                  "split ee tls tail к {back_addr}: {err}"
-                )))?;
-            }
-            let (c2b, b2c) = proxy::copy_bidirectional(client, back_stream).await?;
+            let (c2b, b2c) = match ee_client {
+              EeRelayClient::Tls(tls_io) => {
+                proxy::copy_bidirectional(tls_io, back_stream).await?
+              }
+              EeRelayClient::Plain(plain_client) => {
+                proxy::copy_bidirectional(plain_client, back_stream).await?
+              }
+            };
             state
               .stats
               .bytes_to_backend
-              .fetch_add(c2b + sgfb_initial.len() as u64 + ee_tls_tail.len() as u64, Ordering::Relaxed);
+              .fetch_add(c2b + sgfb_initial.len() as u64, Ordering::Relaxed);
             state.stats.bytes_from_backend.fetch_add(b2c, Ordering::Relaxed);
             tracing::debug!(
               back = %back_addr,
@@ -376,6 +393,117 @@ fn peer_allowed(peer_ip: IpAddr, allowlist: &[String]) -> bool {
   })
 }
 
+async fn handle_back_ee_connection<S>(
+  mut front_stream: S,
+  peer_ip: IpAddr,
+  frame: SplitOpeningFrame,
+  state: &AppState,
+) -> Result<()>
+where
+  S: AsyncRead + AsyncWrite + Unpin,
+{
+  let secret = proxy::resolve_secret_bytes(state, None)?;
+  if frame.initial_data.len() != mtproto_obfuscate::HANDSHAKE_LEN {
+    send_ack(
+      &mut front_stream,
+      false,
+      Some("ee initial_data должен быть 64-байтным obfuscated2 handshake"),
+    )
+    .await?;
+    return Err(StealthGateError::Proxy(
+      "ee initial_data должен быть 64-байтным obfuscated2 handshake".into(),
+    ));
+  }
+  let handshake: [u8; mtproto_obfuscate::HANDSHAKE_LEN] = frame
+    .initial_data
+    .as_slice()
+    .try_into()
+    .expect("handshake len checked");
+  if mtproto_obfuscate::parse_handshake(&handshake, &secret).is_none() {
+    send_ack(
+      &mut front_stream,
+      false,
+      Some("невалидный obfuscated2 handshake в initial_data"),
+    )
+    .await?;
+    return Err(StealthGateError::Proxy(
+      "невалидный obfuscated2 handshake в initial_data".into(),
+    ));
+  }
+
+  // ACK до connect DC — front сразу начинает relay plaintext obfuscated2.
+  send_ack(&mut front_stream, true, None).await?;
+  state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
+
+  let prefixed = PrefixedStream::new(frame.initial_data, front_stream);
+  let accepted = mtproto_obfuscate::accept_handshake(prefixed, &secret).await?;
+  let dc_id = if accepted.dc_id != 0 {
+    accepted.dc_id
+  } else {
+    mtproto_obfuscate::dc_id_from_backend(&frame.backend)
+  };
+
+  let network = {
+    let config = state
+      .config
+      .read()
+      .map_err(|_| StealthGateError::Config("блокировка config poisoned".into()))?;
+    config.network.clone()
+  };
+
+  let pool = state
+    .backend_pool
+    .read()
+    .map_err(|_| StealthGateError::Config("блокировка backend_pool poisoned".into()))?
+    .clone();
+
+  let (mut upstream, connected_backend) = match pool
+    .connect(&network, Some(&frame.backend), &state.stats)
+    .await
+  {
+    Ok(value) => value,
+    Err(err) => {
+      tracing::warn!(
+        %peer_ip,
+        backend = %frame.backend,
+        error = %err,
+        "split back ee: не удалось подключиться к Telegram DC"
+      );
+      return Err(err);
+    }
+  };
+
+  if connected_backend != frame.backend {
+    tracing::info!(
+      preferred = %frame.backend,
+      connected = %connected_backend,
+      "split back ee: failover на другой Telegram DC"
+    );
+  }
+
+  let (header, relay_keys) = mtproto_obfuscate::generate_relay_init(dc_id)?;
+  upstream
+    .write_all(&header)
+    .await
+    .map_err(|err| StealthGateError::Proxy(format!("split ee relay header to DC: {err}")))?;
+  let dc_stream = ObfuscatedStream::from_relay_keys(upstream, relay_keys);
+  let (c2b, b2c) = proxy::copy_bidirectional(accepted.stream, dc_stream).await?;
+  state
+    .stats
+    .bytes_to_backend
+    .fetch_add(c2b + mtproto_obfuscate::HANDSHAKE_LEN as u64, Ordering::Relaxed);
+  state.stats.bytes_from_backend.fetch_add(b2c, Ordering::Relaxed);
+  tracing::debug!(
+    backend = %connected_backend,
+    peer = %peer_ip,
+    c2b,
+    b2c,
+    "split back ee-сессия завершена"
+  );
+
+  Ok(())
+}
+
 /// Back: обрабатывает соединение от front-узла.
 pub async fn handle_back_connection<S>(
   mut front_stream: S,
@@ -430,6 +558,10 @@ where
     "split back: принят SGFB opening-кадр, подключение к Telegram DC"
   );
 
+  if frame.secret_mode == SecretMode::Ee {
+    return handle_back_ee_connection(front_stream, peer_ip, frame, state).await;
+  }
+
   let (fragmentation, drs, dd, webhooks, network) = {
     let config = state
       .config
@@ -482,29 +614,6 @@ where
         "connected": connected_backend,
       })),
     );
-  }
-
-  if frame.secret_mode == SecretMode::Ee {
-    let secret = proxy::resolve_secret_bytes(state, None)?;
-    send_ack(&mut front_stream, true, None).await?;
-    state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
-    let (c2b, b2c) = proxy::relay_ee_streams(
-      FakeTlsStream::new(front_stream),
-      upstream,
-      &secret,
-      &frame.backend,
-    )
-    .await?;
-    state.stats.bytes_to_backend.fetch_add(c2b, Ordering::Relaxed);
-    state.stats.bytes_from_backend.fetch_add(b2c, Ordering::Relaxed);
-    tracing::debug!(
-      backend = %connected_backend,
-      peer = %peer_ip,
-      c2b,
-      b2c,
-      "split back ee-сессия завершена"
-    );
-    return Ok(());
   }
 
   if let Err(err) = proxy::write_initial_to_backend(
