@@ -13,7 +13,6 @@ use crate::config::{SecretMode, SplitConfig, SplitMode};
 use crate::error::{Result, StealthGateError};
 use crate::faketls::FakeTlsStream;
 use crate::io_util::PrefixedStream;
-use crate::mtproto_obfuscate::{self, ObfuscatedStream};
 use crate::proxy;
 use crate::state::AppState;
 
@@ -150,38 +149,25 @@ pub async fn relay_from_front<C>(
 where
   C: AsyncRead + AsyncWrite + Unpin,
 {
-  // Для ee: TLS завершается на front — в SGFB уходит 64-байтный obfuscated2 handshake,
-  // дальше между front и back идёт уже plaintext obfuscated2 (без TLS-обёртки).
+  // Для ee: TLS завершается на front (ServerHello), дальше raw TLS байты туннелируются
+  // в SGFB без разбора — obfuscated2 handshake читает back через FakeTlsStream.
   enum EeRelayClient<C> {
     Plain(C),
-    Tls(FakeTlsStream<PrefixedStream<C>>),
+    RawTls(PrefixedStream<C>),
   }
 
   let (sgfb_initial, ee_client, preconnected_back) = if secret_mode == SecretMode::Ee {
     let secret = proxy::resolve_secret_bytes(state, secret_label)?;
     let client_hello = crate::faketls::parse_client_hello_record(initial_data)?;
     crate::faketls::validate_client_hello(&client_hello, &secret)?;
-    crate::faketls::send_server_hello(&mut client, &client_hello, &secret).await?;
-    let tls_tail = initial_data[client_hello.raw.len()..].to_vec();
-    tracing::debug!(
-      sni = ?client_hello.sni,
-      tls_tail_bytes = tls_tail.len(),
-      "split front: отправлен fake TLS ServerHello клиенту"
-    );
-
-    let mut tls_io = FakeTlsStream::new(PrefixedStream::new(tls_tail, client));
     let timeout = Duration::from_secs(split.connect_timeout_secs);
     let first_back = split.back_servers.first().cloned();
 
-    let (handshake_result, preconnect) = if let Some(back_addr) = first_back {
+    let (server_hello_result, preconnect) = if let Some(back_addr) = first_back {
       tokio::join!(
         async {
-          let mut handshake = [0u8; mtproto_obfuscate::HANDSHAKE_LEN];
-          tls_io
-            .read_exact(&mut handshake)
-            .await
-            .map_err(|err| StealthGateError::Proxy(format!("split front ee handshake: {err}")))?;
-          Ok::<_, StealthGateError>((handshake, tls_io))
+          crate::faketls::send_server_hello(&mut client, &client_hello, &secret).await?;
+          Ok::<_, StealthGateError>(())
         },
         async {
           match tokio::time::timeout(timeout, TcpStream::connect(&back_addr)).await {
@@ -191,30 +177,24 @@ where
         }
       )
     } else {
-      let mut handshake = [0u8; mtproto_obfuscate::HANDSHAKE_LEN];
-      tls_io
-        .read_exact(&mut handshake)
-        .await
-        .map_err(|err| StealthGateError::Proxy(format!("split front ee handshake: {err}")))?;
       (
-        Ok((handshake, tls_io)),
+        crate::faketls::send_server_hello(&mut client, &client_hello, &secret).await,
         None,
       )
     };
+    server_hello_result?;
 
-    let (handshake, tls_io) = handshake_result?;
-    mtproto_obfuscate::parse_handshake(&handshake, &secret).ok_or_else(|| {
-      StealthGateError::Proxy("split front: невалидный obfuscated2 handshake".into())
-    })?;
+    let tls_tail = initial_data[client_hello.raw.len()..].to_vec();
     tracing::debug!(
-      handshake_bytes = handshake.len(),
+      sni = ?client_hello.sni,
+      tls_tail_bytes = tls_tail.len(),
       preconnected = preconnect.is_some(),
-      "split front: прочитан obfuscated2 handshake, передаём в SGFB initial_data"
+      "split front: отправлен fake TLS ServerHello, дальше raw TLS туннель в SGFB"
     );
 
     (
-      handshake.to_vec(),
-      EeRelayClient::Tls(tls_io),
+      Vec::new(),
+      EeRelayClient::RawTls(PrefixedStream::new(tls_tail, client)),
       preconnect,
     )
   } else {
@@ -277,8 +257,8 @@ where
           Ok(Ok(_)) if ack[0] == ACK_OK => {
             state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
             let (c2b, b2c) = match ee_client {
-              EeRelayClient::Tls(tls_io) => {
-                proxy::copy_bidirectional(tls_io, back_stream).await?
+              EeRelayClient::RawTls(raw_tls) => {
+                proxy::copy_bidirectional(raw_tls, back_stream).await?
               }
               EeRelayClient::Plain(plain_client) => {
                 proxy::copy_bidirectional(plain_client, back_stream).await?
@@ -451,34 +431,24 @@ async fn handle_back_ee_connection<S>(
 where
   S: AsyncRead + AsyncWrite + Unpin,
 {
+  if !frame.initial_data.is_empty() {
+    tracing::warn!(
+      %peer_ip,
+      initial_bytes = frame.initial_data.len(),
+      "split back ee: ненулевой initial_data устарел, ожидается raw TLS после ACK"
+    );
+    send_ack(
+      &mut front_stream,
+      false,
+      Some("ee split: обновите front — initial_data должен быть пустым"),
+    )
+    .await?;
+    return Err(StealthGateError::Proxy(
+      "ee split: ненулевой initial_data, нужен raw TLS туннель".into(),
+    ));
+  }
+
   let secret = proxy::resolve_secret_bytes(state, None)?;
-  if frame.initial_data.len() != mtproto_obfuscate::HANDSHAKE_LEN {
-    send_ack(
-      &mut front_stream,
-      false,
-      Some("ee initial_data должен быть 64-байтным obfuscated2 handshake"),
-    )
-    .await?;
-    return Err(StealthGateError::Proxy(
-      "ee initial_data должен быть 64-байтным obfuscated2 handshake".into(),
-    ));
-  }
-  let handshake: [u8; mtproto_obfuscate::HANDSHAKE_LEN] = frame
-    .initial_data
-    .as_slice()
-    .try_into()
-    .expect("handshake len checked");
-  if mtproto_obfuscate::parse_handshake(&handshake, &secret).is_none() {
-    send_ack(
-      &mut front_stream,
-      false,
-      Some("невалидный obfuscated2 handshake в initial_data"),
-    )
-    .await?;
-    return Err(StealthGateError::Proxy(
-      "невалидный obfuscated2 handshake в initial_data".into(),
-    ));
-  }
 
   let network = {
     let config = state
@@ -494,15 +464,10 @@ where
     .map_err(|_| StealthGateError::Config("блокировка backend_pool poisoned".into()))?
     .clone();
 
-  tokio::pin! {
-    let dc_connect = pool.connect(&network, Some(&frame.backend), &state.stats);
-  }
-
-  let relay_dc_id = mtproto_obfuscate::handshake_dc_index(&handshake, &secret)
-    .filter(|&dc| dc != 0)
-    .unwrap_or_else(|| mtproto_obfuscate::dc_id_from_backend(&frame.backend));
-
-  let (mut upstream, connected_backend) = match dc_connect.await {
+  let (upstream, connected_backend) = match pool
+    .connect(&network, Some(&frame.backend), &state.stats)
+    .await
+  {
     Ok(value) => value,
     Err(err) => {
       tracing::warn!(
@@ -524,31 +489,27 @@ where
     );
   }
 
-  let (header, relay_keys) = mtproto_obfuscate::generate_relay_init(relay_dc_id)?;
-  upstream
-    .write_all(&header)
-    .await
-    .map_err(|err| StealthGateError::Proxy(format!("split ee relay header to DC: {err}")))?;
-
-  tracing::debug!(
-    %peer_ip,
-    relay_dc_id,
-    backend = %connected_backend,
-    "split back ee: relay init отправлен в DC, отдаём ACK front"
-  );
-
-  // ACK только после relay init — DC готов принимать клиентские данные.
+  // ACK до чтения handshake — front начинает raw TLS туннель.
   send_ack(&mut front_stream, true, None).await?;
   state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
 
-  let prefixed = PrefixedStream::new(frame.initial_data, front_stream);
-  let accepted = mtproto_obfuscate::accept_handshake(prefixed, &secret).await?;
-  let dc_stream = ObfuscatedStream::from_relay_keys(upstream, relay_keys);
-  let (c2b, b2c) = proxy::copy_bidirectional(accepted.stream, dc_stream).await?;
+  tracing::debug!(
+    %peer_ip,
+    backend = %connected_backend,
+    "split back ee: ACK front, relay через FakeTlsStream (как monolith)"
+  );
+
+  let (c2b, b2c) = proxy::relay_ee_streams(
+    FakeTlsStream::new(front_stream),
+    upstream,
+    &secret,
+    &frame.backend,
+  )
+  .await?;
   state
     .stats
     .bytes_to_backend
-    .fetch_add(c2b + mtproto_obfuscate::HANDSHAKE_LEN as u64, Ordering::Relaxed);
+    .fetch_add(c2b, Ordering::Relaxed);
   state.stats.bytes_from_backend.fetch_add(b2c, Ordering::Relaxed);
   tracing::debug!(
     backend = %connected_backend,
