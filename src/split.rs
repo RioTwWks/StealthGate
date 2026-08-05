@@ -13,6 +13,7 @@ use crate::config::{SecretMode, SplitConfig, SplitMode};
 use crate::error::{Result, StealthGateError};
 use crate::faketls::FakeTlsStream;
 use crate::io_util::PrefixedStream;
+use crate::mtproto_obfuscate::{self, ObfuscatedStream};
 use crate::proxy;
 use crate::state::AppState;
 
@@ -136,6 +137,69 @@ fn byte_to_secret_mode(value: u8) -> Result<SecretMode> {
   }
 }
 
+/// Читает ACK от back, параллельно буферизуя TLS-данные клиента (ee split).
+async fn wait_split_ack_while_buffering<C>(
+  back_stream: &mut TcpStream,
+  client: &mut C,
+  timeout: Duration,
+) -> Result<Vec<u8>>
+where
+  C: AsyncRead + Unpin,
+{
+  let mut ack = [0u8; 1];
+  let mut buffered = Vec::new();
+  let mut buf = [0u8; 8192];
+
+  loop {
+    tokio::select! {
+      biased;
+      result = tokio::time::timeout(timeout, back_stream.read(&mut ack)) => {
+        return match result {
+          Ok(Ok(1)) if ack[0] == ACK_OK => Ok(buffered),
+          Ok(Ok(1)) => {
+            let mut err_buf = vec![0u8; 512];
+            let n = back_stream.read(&mut err_buf).await.unwrap_or(0);
+            let msg = String::from_utf8_lossy(&err_buf[..n]);
+            Err(StealthGateError::Proxy(format!(
+              "split back отклонил: {msg}"
+            )))
+          }
+          Ok(Ok(0)) => Err(StealthGateError::Proxy(
+            "split ack: back закрыл соединение".into(),
+          )),
+          Ok(Ok(_)) => Err(StealthGateError::Proxy(
+            "split ack: неполный ответ back".into(),
+          )),
+          Ok(Err(err)) => Err(StealthGateError::Proxy(format!("split ack read: {err}"))),
+          Err(_) => Err(StealthGateError::Proxy("split ack timeout".into())),
+        };
+      }
+      n = client.read(&mut buf) => {
+        match n {
+          Ok(0) => {
+            return Err(StealthGateError::Proxy(
+              "split front ee: early eof клиента во время ожидания ACK".into(),
+            ));
+          }
+          Ok(n) => {
+            tracing::trace!(
+              bytes = n,
+              total_buffered = buffered.len() + n,
+              "split front: буфер TLS во время ожидания ACK"
+            );
+            buffered.extend_from_slice(&buf[..n]);
+          }
+          Err(err) => {
+            return Err(StealthGateError::Proxy(format!(
+              "split front ee read во время ACK: {err}"
+            )));
+          }
+        }
+      }
+    }
+  }
+}
+
 /// Front: проксирует MTProto-сессию на back-узел.
 pub async fn relay_from_front<C>(
   mut client: C,
@@ -151,12 +215,18 @@ where
 {
   // Для ee: TLS завершается на front (ServerHello), дальше raw TLS байты туннелируются
   // в SGFB без разбора — obfuscated2 handshake читает back через FakeTlsStream.
-  enum EeRelayClient<C> {
-    Plain(C),
-    RawTls(PrefixedStream<C>),
+  enum FrontRelay<C> {
+    Plain {
+      initial: Vec<u8>,
+      client: C,
+    },
+    EeTls {
+      tls_tail: Vec<u8>,
+      client: C,
+    },
   }
 
-  let (sgfb_initial, ee_client, preconnected_back) = if secret_mode == SecretMode::Ee {
+  let (sgfb_initial, mut front_relay, preconnected_back) = if secret_mode == SecretMode::Ee {
     let secret = proxy::resolve_secret_bytes(state, secret_label)?;
     let client_hello = crate::faketls::parse_client_hello_record(initial_data)?;
     crate::faketls::validate_client_hello(&client_hello, &secret)?;
@@ -194,13 +264,16 @@ where
 
     (
       Vec::new(),
-      EeRelayClient::RawTls(PrefixedStream::new(tls_tail, client)),
+      FrontRelay::EeTls { tls_tail, client },
       preconnect,
     )
   } else {
     (
       initial_data.to_vec(),
-      EeRelayClient::Plain(client),
+      FrontRelay::Plain {
+        initial: initial_data.to_vec(),
+        client,
+      },
       None,
     )
   };
@@ -252,16 +325,48 @@ where
           continue;
         }
 
-        let mut ack = [0u8; 1];
-        match tokio::time::timeout(timeout, back_stream.read_exact(&mut ack)).await {
-          Ok(Ok(_)) if ack[0] == ACK_OK => {
+        let ack_result = match &mut front_relay {
+          FrontRelay::EeTls { client, .. } => {
+            wait_split_ack_while_buffering(&mut back_stream, client, timeout).await
+          }
+          FrontRelay::Plain { .. } => {
+            let mut ack = [0u8; 1];
+            tokio::time::timeout(timeout, back_stream.read_exact(&mut ack))
+              .await
+              .map_err(|_| StealthGateError::Proxy(format!("split ack timeout {back_addr}")))
+              .and_then(|result| {
+                result.map_err(|err| {
+                  StealthGateError::Proxy(format!("split ack read {back_addr}: {err}"))
+                })
+              })
+              .and_then(|_| {
+                if ack[0] == ACK_OK {
+                  Ok(Vec::new())
+                } else {
+                  Err(StealthGateError::Proxy(format!(
+                    "split back {back_addr} отклонил сессию"
+                  )))
+                }
+              })
+          }
+        };
+
+        match ack_result {
+          Ok(buffered_tls) => {
             state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
-            let (c2b, b2c) = match ee_client {
-              EeRelayClient::RawTls(raw_tls) => {
-                proxy::copy_bidirectional(raw_tls, back_stream).await?
+            let (c2b, b2c) = match front_relay {
+              FrontRelay::EeTls { mut tls_tail, client } => {
+                tls_tail.extend(buffered_tls);
+                tracing::debug!(
+                  tls_prefix_bytes = tls_tail.len(),
+                  "split front ee: ACK получен, старт raw TLS туннеля"
+                );
+                let client_io = PrefixedStream::new(tls_tail, client);
+                proxy::copy_bidirectional(client_io, back_stream).await?
               }
-              EeRelayClient::Plain(plain_client) => {
-                proxy::copy_bidirectional(plain_client, back_stream).await?
+              FrontRelay::Plain { initial, client } => {
+                let client_io = PrefixedStream::new(initial, client);
+                proxy::copy_bidirectional(client_io, back_stream).await?
               }
             };
             state
@@ -277,23 +382,8 @@ where
             );
             return Ok(());
           }
-          Ok(Ok(_)) => {
-            let mut err_buf = vec![0u8; 512];
-            let n = back_stream.read(&mut err_buf).await.unwrap_or(0);
-            let msg = String::from_utf8_lossy(&err_buf[..n]);
-            last_error = Some(StealthGateError::Proxy(format!(
-              "split back {back_addr} отклонил: {msg}"
-            )));
-          }
-          Ok(Err(err)) => {
-            last_error = Some(StealthGateError::Proxy(format!(
-              "split ack read {back_addr}: {err}"
-            )));
-          }
-          Err(_) => {
-            last_error = Some(StealthGateError::Proxy(format!(
-              "split ack timeout {back_addr}"
-            )));
+          Err(err) => {
+            last_error = Some(err);
           }
         }
       }
@@ -464,7 +554,7 @@ where
     .map_err(|_| StealthGateError::Config("блокировка backend_pool poisoned".into()))?
     .clone();
 
-  let (upstream, connected_backend) = match pool
+  let (mut upstream, connected_backend) = match pool
     .connect(&network, Some(&frame.backend), &state.stats)
     .await
   {
@@ -489,21 +579,29 @@ where
     );
   }
 
-  // ACK до чтения handshake — front начинает raw TLS туннель.
-  send_ack(&mut front_stream, true, None).await?;
-  state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
+  let relay_dc_id = mtproto_obfuscate::dc_id_from_backend(&frame.backend);
+  let (header, relay_keys) = mtproto_obfuscate::generate_relay_init(relay_dc_id)?;
+  upstream
+    .write_all(&header)
+    .await
+    .map_err(|err| StealthGateError::Proxy(format!("split ee relay header to DC: {err}")))?;
 
   tracing::debug!(
     %peer_ip,
+    relay_dc_id,
     backend = %connected_backend,
-    "split back ee: ACK front, relay через FakeTlsStream (как monolith)"
+    "split back ee: relay init в DC, ACK front для старта TLS-туннеля"
   );
 
-  let (c2b, b2c) = proxy::relay_ee_streams(
+  // ACK после relay init — front начинает raw TLS туннель, DC уже готов.
+  send_ack(&mut front_stream, true, None).await?;
+  state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
+
+  let dc_stream = ObfuscatedStream::from_relay_keys(upstream, relay_keys);
+  let (c2b, b2c) = proxy::relay_ee_to_prepared_dc(
     FakeTlsStream::new(front_stream),
-    upstream,
+    dc_stream,
     &secret,
-    &frame.backend,
   )
   .await?;
   state

@@ -185,6 +185,20 @@ where
   copy_bidirectional(accepted.stream, dc_stream).await
 }
 
+/// Мост ee Fake TLS → уже инициализированный obfuscated2-поток к DC (relay init уже отправлен).
+pub async fn relay_ee_to_prepared_dc<C, U>(
+  client_io: C,
+  dc_stream: ObfuscatedStream<U>,
+  secret: &[u8],
+) -> Result<(u64, u64)>
+where
+  C: AsyncRead + AsyncWrite + Unpin,
+  U: AsyncRead + AsyncWrite + Unpin,
+{
+  let accepted = mtproto_obfuscate::accept_handshake(client_io, secret).await?;
+  copy_bidirectional(accepted.stream, dc_stream).await
+}
+
 pub(crate) fn resolve_secret_bytes(state: &AppState, label: Option<&str>) -> Result<Vec<u8>> {
   let routes = {
     let config = state
