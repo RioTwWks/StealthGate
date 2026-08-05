@@ -387,6 +387,14 @@ where
     return Err(StealthGateError::Proxy("неверный split auth_token".into()));
   }
 
+  tracing::info!(
+    %peer_ip,
+    backend = %frame.backend,
+    secret_mode = ?frame.secret_mode,
+    initial_bytes = frame.initial_data.len(),
+    "split back: принят SGFB opening-кадр, подключение к Telegram DC"
+  );
+
   let (fragmentation, drs, dd, webhooks, network) = {
     let config = state
       .config
@@ -413,12 +421,24 @@ where
   {
     Ok(value) => value,
     Err(err) => {
+      tracing::warn!(
+        %peer_ip,
+        backend = %frame.backend,
+        error = %err,
+        socks5 = network.socks5_proxy.is_some(),
+        "split back: не удалось подключиться к Telegram DC"
+      );
       send_ack(&mut front_stream, false, Some(&err.to_string())).await?;
       return Err(err);
     }
   };
 
   if connected_backend != frame.backend {
+    tracing::info!(
+      preferred = %frame.backend,
+      connected = %connected_backend,
+      "split back: failover на другой Telegram DC"
+    );
     crate::webhooks::dispatch(
       &webhooks,
       crate::webhooks::WebhookEvent::BackendFailover,

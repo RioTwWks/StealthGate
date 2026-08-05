@@ -78,3 +78,62 @@ front_allowlist = ["10.0.0.1"]
 
 - `stealthgate_split_relayed_total`
 - `stealthgate_split_auth_failed_total`
+
+## Диагностика: EU не подключается к Telegram DC
+
+Если на **front** видно `MTProto-соединение` и `split front: отправка SGFB`, а на **back** — `таймаут подключения к 149.154.x.x:443` или `нет доступных backend-серверов`, цепочка SGFB работает, но **EU-сервер не может достучаться до Telegram DC**.
+
+### Проверка с EU-сервера
+
+```bash
+# TCP до DC (должно быть Connected / succeeded)
+nc -vz -w 5 149.154.167.99 443
+nc -vz -w 5 149.154.175.50 443
+nc -vz -w 5 91.108.56.100 443
+
+# Исходящий firewall
+sudo iptables -L OUTPUT -n -v | head
+sudo ufw status
+```
+
+Частые причины:
+- хостинг блокирует исходящие к `149.154.0.0/16` (Telegram);
+- закрыт исходящий TCP/443 на firewall;
+- после первой неудачи оба DC помечены «unhealthy» на 30 с → `нет доступных backend-серверов` (подождите или перезапустите back).
+
+### Обход через SOCKS5
+
+Если прямой выход к Telegram заблокирован, в `config.back.toml`:
+
+```toml
+[network]
+socks5_proxy = "socks5://127.0.0.1:1080"
+backend_timeout_secs = 15
+```
+
+### Дополнительные DC в пуле
+
+```toml
+[mtproto]
+backend = "149.154.167.99:443"
+backends = [
+  "149.154.175.50:443",
+  "149.154.167.51:443",
+  "91.108.56.100:443",
+]
+failover_strategy = "priority"
+```
+
+### Успешные логи
+
+**RU (front):**
+```
+INFO MTProto-соединение ... split=Front
+INFO split front: отправка SGFB opening-кадра на back
+```
+
+**EU (back):**
+```
+INFO split back: принят SGFB opening-кадр, подключение к Telegram DC
+# без WARN про backend
+```
