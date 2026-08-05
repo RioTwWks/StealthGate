@@ -11,6 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::config::{SecretMode, SplitConfig, SplitMode};
 use crate::error::{Result, StealthGateError};
+use crate::faketls::FakeTlsStream;
 use crate::proxy;
 use crate::state::AppState;
 
@@ -147,16 +148,30 @@ pub async fn relay_from_front<C>(
 where
   C: AsyncRead + AsyncWrite + Unpin,
 {
-  if secret_mode == SecretMode::Ee {
+  // Для ee: ClientHello уже обработан на front; в SGFB уходит только хвост TLS
+  // (если клиент отправил Application Data вместе с ClientHello). Дальше — сырой
+  // TLS-трафик клиента, который back разбирает через FakeTlsStream.
+  let ee_tls_tail = if secret_mode == SecretMode::Ee {
     let secret = proxy::resolve_secret_bytes(state, secret_label)?;
     let client_hello = crate::faketls::parse_client_hello_record(initial_data)?;
     crate::faketls::validate_client_hello(&client_hello, &secret)?;
     crate::faketls::send_server_hello(&mut client, &client_hello, &secret).await?;
+    let tail = initial_data[client_hello.raw.len()..].to_vec();
     tracing::debug!(
       sni = ?client_hello.sni,
+      tls_tail_bytes = tail.len(),
       "split front: отправлен fake TLS ServerHello клиенту"
     );
-  }
+    tail
+  } else {
+    Vec::new()
+  };
+
+  let sgfb_initial: &[u8] = if secret_mode == SecretMode::Ee {
+    &[]
+  } else {
+    initial_data
+  };
 
   let token = split
     .auth_token
@@ -169,7 +184,7 @@ where
     ));
   }
 
-  let frame = encode_opening_frame(token, secret_mode, preferred_backend, initial_data)?;
+  let frame = encode_opening_frame(token, secret_mode, preferred_backend, sgfb_initial)?;
   let timeout = Duration::from_secs(split.connect_timeout_secs);
   let mut last_error = None;
 
@@ -194,11 +209,19 @@ where
         match tokio::time::timeout(timeout, back_stream.read_exact(&mut ack)).await {
           Ok(Ok(_)) if ack[0] == ACK_OK => {
             state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
+            if !ee_tls_tail.is_empty() {
+              back_stream
+                .write_all(&ee_tls_tail)
+                .await
+                .map_err(|err| StealthGateError::Proxy(format!(
+                  "split ee tls tail к {back_addr}: {err}"
+                )))?;
+            }
             let (c2b, b2c) = proxy::copy_bidirectional(client, back_stream).await?;
             state
               .stats
               .bytes_to_backend
-              .fetch_add(c2b + initial_data.len() as u64, Ordering::Relaxed);
+              .fetch_add(c2b + sgfb_initial.len() as u64 + ee_tls_tail.len() as u64, Ordering::Relaxed);
             state.stats.bytes_from_backend.fetch_add(b2c, Ordering::Relaxed);
             tracing::debug!(
               back = %back_addr,
@@ -465,7 +488,13 @@ where
     let secret = proxy::resolve_secret_bytes(state, None)?;
     send_ack(&mut front_stream, true, None).await?;
     state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
-    let (c2b, b2c) = proxy::relay_ee_streams(front_stream, upstream, &secret, &frame.backend).await?;
+    let (c2b, b2c) = proxy::relay_ee_streams(
+      FakeTlsStream::new(front_stream),
+      upstream,
+      &secret,
+      &frame.backend,
+    )
+    .await?;
     state.stats.bytes_to_backend.fetch_add(c2b, Ordering::Relaxed);
     state.stats.bytes_from_backend.fetch_add(b2c, Ordering::Relaxed);
     tracing::debug!(
