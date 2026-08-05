@@ -10,7 +10,9 @@ use tokio_rustls::TlsAcceptor;
 use crate::admin;
 use crate::antireplay::client_hello_fingerprint;
 use crate::config::{Config, SecretMode, SplitMode};
-use crate::detector::{DetectionResult, Detector, TrafficType};
+use crate::detector::{
+  classify_peek, fallback_diagnostic_message, DetectionResult, Detector, TrafficType,
+};
 use crate::domain_fronting::{forward_tcp, resolve_fronting_target};
 use crate::error::{Result, StealthGateError};
 use crate::fallback;
@@ -257,7 +259,35 @@ async fn handle_fallback_path(
   state: &AppState,
 ) -> Result<()> {
   state.stats.fallback_connections.fetch_add(1, Ordering::Relaxed);
-  tracing::debug!(sni = ?detection.sni, tls = ctx.tls_enabled, "fallback-соединение");
+
+  let hint = classify_peek(&peek_buf);
+  let has_ee_route = {
+    let config = state
+      .config
+      .read()
+      .map_err(|_| StealthGateError::Config("блокировка config poisoned".into()))?;
+    config
+      .mtproto
+      .all_secrets()
+      .iter()
+      .any(|route| route.mode == SecretMode::Ee)
+  };
+
+  tracing::debug!(
+    sni = ?detection.sni,
+    tls_termination = ctx.tls_enabled,
+    traffic_hint = ?hint,
+    "fallback-соединение"
+  );
+
+  if let Some(message) = fallback_diagnostic_message(hint, has_ee_route) {
+    tracing::warn!(
+      peek_prefix = %hex::encode(&peek_buf[..peek_buf.len().min(8)]),
+      peek_len = peek_buf.len(),
+      %message,
+      "MTProto не распознан"
+    );
+  }
 
   if let Some(target) = resolve_fronting_target(&ctx.fallback_cfg, detection.sni.as_deref()) {
     state.stats.domain_fronted.fetch_add(1, Ordering::Relaxed);

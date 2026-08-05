@@ -238,6 +238,8 @@ where
 async fn read_opening_frame(
   stream: &mut (impl AsyncRead + Unpin),
   max_bytes: usize,
+  peer_ip: IpAddr,
+  front_allowlist: &[String],
 ) -> Result<Vec<u8>> {
   let mut header = vec![0u8; 40];
   stream
@@ -246,10 +248,24 @@ async fn read_opening_frame(
     .map_err(|err| StealthGateError::Proxy(format!("split opening header: {err}")))?;
 
   if header[0..4] != *MAGIC {
+    let from_allowed_front = peer_allowed(peer_ip, front_allowlist);
     tracing::warn!(
+      %peer_ip,
       peer_prefix = %hex::encode(&header[..header.len().min(16)]),
-      "split back: ожидался SGFB, получены другие байты (возможен прямой TLS/HTTP или port-forward без SGFB)"
+      from_allowed_front,
+      "split back: ожидался SGFB (53474642), получены другие байты"
     );
+    if from_allowed_front {
+      tracing::warn!(
+        %peer_ip,
+        "похоже на сырой TCP port-forward с front-узла (socat/iptables) вместо SGFB от StealthGate front. \
+         Уберите DNAT/socat на RU:14443→EU:14443; front должен слать SGFB только после детекции MTProto"
+      );
+    } else {
+      tracing::warn!(
+        "возможен прямой TLS/HTTP на split-порт или port-forward без SGFB"
+      );
+    }
     return Err(StealthGateError::Proxy("неверный split magic".into()));
   }
 
@@ -349,7 +365,13 @@ where
     .as_deref()
     .ok_or_else(|| StealthGateError::Config("split.auth_token не задан".into()))?;
 
-  let raw = read_opening_frame(&mut front_stream, MAX_INITIAL_LEN).await?;
+  let raw = read_opening_frame(
+    &mut front_stream,
+    MAX_INITIAL_LEN,
+    peer_ip,
+    &split.front_allowlist,
+  )
+  .await?;
   let frame = decode_opening_frame(&raw)?;
 
   if frame.initial_data.len() > MAX_INITIAL_LEN {
@@ -536,7 +558,12 @@ mod tests {
 
     let server = tokio::spawn(async move {
       let (mut stream, _) = listener.accept().await.expect("accept");
-      let raw = read_opening_frame(&mut stream, MAX_INITIAL_LEN)
+      let raw = read_opening_frame(
+        &mut stream,
+        MAX_INITIAL_LEN,
+        "127.0.0.1".parse().expect("ip"),
+        &[],
+      )
         .await
         .expect("read frame");
       assert_eq!(&raw[5..37], hash_auth_token(token));

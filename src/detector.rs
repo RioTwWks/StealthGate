@@ -2,6 +2,21 @@ use crate::config::{decode_secret, SecretMode, SecretRoute};
 use crate::error::Result;
 use crate::tls::{looks_like_tls_client_hello, parse_client_hello, parse_record};
 
+/// Подсказка о формате нераспознанного трафика (для диагностики).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrafficHint {
+  /// TLS ClientHello (`16 03 01/02/03`).
+  TlsClientHello,
+  /// Другая TLS-запись.
+  TlsOther,
+  /// HTTP-запрос.
+  Http,
+  /// Похоже на обфусцированный MTProto (dd / random), не ee Fake TLS.
+  ObfuscatedMtproto,
+  /// Не удалось классифицировать.
+  Unknown,
+}
+
 /// Тип входящего соединения.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrafficType {
@@ -156,6 +171,54 @@ impl Detector {
   }
 }
 
+/// Классифицирует начальный буфер для диагностики fallback-соединений.
+pub fn classify_peek(data: &[u8]) -> TrafficHint {
+  if data.is_empty() {
+    return TrafficHint::Unknown;
+  }
+
+  if data.starts_with(b"GET ")
+    || data.starts_with(b"HEAD ")
+    || data.starts_with(b"POST ")
+    || data.starts_with(b"PUT ")
+    || data.starts_with(b"OPTIONS ")
+  {
+    return TrafficHint::Http;
+  }
+
+  if looks_like_tls_client_hello(data) {
+    return TrafficHint::TlsClientHello;
+  }
+
+  if data.len() >= 3 && data[0] == 0x16 && data[1] == 0x03 {
+    return TrafficHint::TlsOther;
+  }
+
+  // ee Fake TLS всегда начинается с TLS ClientHello. Случайные байты — типичный dd/obfuscated.
+  if data.len() >= 64 {
+    return TrafficHint::ObfuscatedMtproto;
+  }
+
+  TrafficHint::Unknown
+}
+
+/// Текст подсказки для оператора при нераспознанном MTProto-трафике.
+pub fn fallback_diagnostic_message(hint: TrafficHint, has_ee_route: bool) -> Option<&'static str> {
+  match hint {
+    TrafficHint::ObfuscatedMtproto if has_ee_route => Some(
+      "похоже на обфусцированный MTProto (dd/random), а не ee Fake TLS (ожидается префикс 160301). \
+       Проверьте секрет в Telegram: нужен полный ee-секрет с hex-доменом fake_domain",
+    ),
+    TrafficHint::TlsClientHello if has_ee_route => Some(
+      "TLS ClientHello без совпадения SNI с fake_domain/sni_pool — проверьте домен в ee-секрете Telegram",
+    ),
+    TrafficHint::TlsOther if has_ee_route => Some(
+      "получена TLS-запись, но не ClientHello — клиент может использовать неверный режим прокси",
+    ),
+    _ => None,
+  }
+}
+
 fn extract_sni(data: &[u8]) -> Option<String> {
   if !looks_like_tls_client_hello(data) {
     return None;
@@ -237,6 +300,14 @@ mod tests {
     assert_eq!(result.secret_mode, Some(SecretMode::Ee));
     assert_eq!(result.backend.as_deref(), Some("2.2.2.2:443"));
     assert_eq!(result.max_connections, 10);
+  }
+
+  #[test]
+  fn classifies_obfuscated_peek_hint() {
+    let short = vec![0xC0, 0x14, 0x46, 0x9A, 0xDD, 0xA4, 0x67, 0x01];
+    assert_eq!(classify_peek(&short), TrafficHint::Unknown);
+    let long = vec![0u8; 128];
+    assert_eq!(classify_peek(&long), TrafficHint::ObfuscatedMtproto);
   }
 
   #[test]
