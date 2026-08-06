@@ -171,19 +171,6 @@ impl Detector {
         }
       }
 
-      if let Some(ref domain) = sni {
-        if self.matches_fake_domain(domain) {
-          let route = self.routes.first();
-          return DetectionResult::mtproto(
-            sni.clone(),
-            route.map(|r| r.label.clone()).unwrap_or_else(|| "default".into()),
-            route.map(|r| r.mode).unwrap_or(SecretMode::Ee),
-            route.map(|r| r.backend.clone()).unwrap_or_default(),
-            route.map(|r| r.max_connections).unwrap_or(0),
-          );
-        }
-      }
-
       if let Some(route) = self.match_probable_ee_client_hello(data) {
         return DetectionResult::mtproto(
           sni.clone(),
@@ -391,7 +378,7 @@ mod tests {
   }
 
   #[test]
-  fn detects_ee_by_any_sni_in_pool() {
+  fn detects_ee_by_any_sni_in_pool_requires_valid_hmac() {
     use crate::tls::test_support::build_client_hello;
 
     let routes = vec![SecretRoute {
@@ -409,7 +396,11 @@ mod tests {
 
     let payload = build_client_hello("google.com");
     let result = detector.detect(&payload);
-    assert_eq!(result.traffic_type, TrafficType::Mtproto);
+    assert_eq!(
+      result.traffic_type,
+      TrafficType::Fallback,
+      "TLS ClientHello без ee HMAC не должен попадать в MTProto"
+    );
 
     let payload = build_client_hello("example.com");
     let result = detector.detect(&payload);

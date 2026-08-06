@@ -21,6 +21,39 @@ const MAX_TLS_PAYLOAD: usize = 16_384;
 const HELLO_TIMESTAMP_SKEW_SECS: u64 = 120;
 const SERVER_HELLO_RANDOM_OFFSET: usize = 11;
 
+/// Параметры записи TLS Application Data (DRS + padding).
+#[derive(Debug, Clone)]
+pub struct FakeTlsWriteOptions {
+  pub record_sizes: Vec<usize>,
+  pub padding: bool,
+}
+
+impl Default for FakeTlsWriteOptions {
+  fn default() -> Self {
+    Self {
+      record_sizes: vec![512, 1024, 1398, 256],
+      padding: true,
+    }
+  }
+}
+
+impl FakeTlsWriteOptions {
+  pub fn from_drs(drs: &crate::config::DrsConfig) -> Option<Self> {
+    if !drs.enabled && !drs.ee_relay {
+      return None;
+    }
+    let record_sizes = if drs.record_sizes.is_empty() {
+      vec![512, 1024, 1398, 256]
+    } else {
+      drs.record_sizes.clone()
+    };
+    Some(Self {
+      record_sizes,
+      padding: true,
+    })
+  }
+}
+
 /// Разобранный TLS ClientHello с полной записью.
 #[derive(Debug, Clone)]
 pub struct ParsedClientHello {
@@ -174,6 +207,32 @@ pub fn validate_client_hello(ch: &ParsedClientHello, secret: &[u8]) -> Result<()
   Ok(())
 }
 
+/// Собирает ClientHello с валидным ee HMAC (для тестов и E2E).
+pub fn build_signed_client_hello(sni: &str, secret: &[u8]) -> Vec<u8> {
+  let mut data = crate::tls::test_support::build_client_hello(sni);
+  let mut modified = data.clone();
+  modified[SERVER_HELLO_RANDOM_OFFSET..SERVER_HELLO_RANDOM_OFFSET + 32].fill(0);
+
+  let mut mac = HmacSha256::new_from_slice(secret).expect("hmac key");
+  mac.update(&modified);
+  let digest = mac.finalize().into_bytes();
+
+  let now = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .unwrap_or_default()
+    .as_secs() as u32;
+  let ts_bytes = now.to_le_bytes();
+
+  for i in 0..28 {
+    data[SERVER_HELLO_RANDOM_OFFSET + i] = digest[i];
+  }
+  for i in 0..4 {
+    data[SERVER_HELLO_RANDOM_OFFSET + 28 + i] = digest[28 + i] ^ ts_bytes[i];
+  }
+
+  data
+}
+
 /// Отправляет синтетический TLS ServerHello + ChangeCipherSpec + padding.
 pub async fn send_server_hello<S>(
   stream: &mut S,
@@ -274,19 +333,58 @@ fn write_tls_record(buf: &mut Vec<u8>, record_type: u8, payload: &[u8]) {
 pub struct FakeTlsStream<S> {
   inner: S,
   read_buf: Vec<u8>,
+  write_opts: Option<FakeTlsWriteOptions>,
+  write_size_idx: usize,
 }
 
 impl<S> FakeTlsStream<S> {
   pub fn new(inner: S) -> Self {
+    Self::with_write_options(inner, None)
+  }
+
+  pub fn with_write_options(inner: S, write_opts: Option<FakeTlsWriteOptions>) -> Self {
     Self {
       inner,
       read_buf: Vec::new(),
+      write_opts,
+      write_size_idx: 0,
     }
   }
 
   /// Забирает байты, оставшиеся после разбора TLS Application Data (например, хвост кадра с handshake).
   pub fn take_read_buf(&mut self) -> Vec<u8> {
     std::mem::take(&mut self.read_buf)
+  }
+
+  fn next_chunk_size(&mut self, remaining: usize) -> usize {
+    let Some(opts) = &self.write_opts else {
+      return remaining.min(MAX_TLS_PAYLOAD);
+    };
+    if opts.record_sizes.is_empty() {
+      return remaining.min(MAX_TLS_PAYLOAD);
+    }
+    let size = opts.record_sizes[self.write_size_idx % opts.record_sizes.len()].max(1);
+    self.write_size_idx += 1;
+    remaining.min(size).min(MAX_TLS_PAYLOAD)
+  }
+
+  fn maybe_pad_payload(&self, payload: &mut Vec<u8>) {
+    let Some(opts) = &self.write_opts else {
+      return;
+    };
+    if !opts.padding || payload.is_empty() {
+      return;
+    }
+    let pad_budget = MAX_TLS_PAYLOAD.saturating_sub(payload.len());
+    if pad_budget == 0 {
+      return;
+    }
+    let pad_len = rand::thread_rng().next_u32() as usize % pad_budget.min(64 + 1);
+    if pad_len > 0 {
+      let mut pad = vec![0u8; pad_len];
+      rand::thread_rng().fill_bytes(&mut pad);
+      payload.extend_from_slice(&pad);
+    }
   }
 }
 
@@ -347,10 +445,12 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for FakeTlsStream<S> {
   ) -> Poll<std::io::Result<usize>> {
     let mut offset = 0usize;
     while offset < buf.len() {
-      let chunk_end = (offset + MAX_TLS_PAYLOAD).min(buf.len());
+      let chunk_end = offset + self.next_chunk_size(buf.len() - offset);
       let chunk = &buf[offset..chunk_end];
-      let mut record = Vec::with_capacity(5 + chunk.len());
-      write_tls_record(&mut record, TLS_APPLICATION_DATA, chunk);
+      let mut payload = chunk.to_vec();
+      self.maybe_pad_payload(&mut payload);
+      let mut record = Vec::with_capacity(5 + payload.len());
+      write_tls_record(&mut record, TLS_APPLICATION_DATA, &payload);
       let mut written = 0usize;
       while written < record.len() {
         match Pin::new(&mut self.inner).poll_write(cx, &record[written..]) {

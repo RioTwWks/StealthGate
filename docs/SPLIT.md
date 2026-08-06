@@ -28,7 +28,7 @@ MAGIC "SGFB" (4) | VERSION (1) | SHA256(auth_token) (32)
 
 Back отвечает 1 байтом: `0x00` = OK, `0x01` = ошибка (+ UTF-8 сообщение).
 
-После ACK — сырой bidirectional relay.
+После ACK — bidirectional relay. При `encrypt_relay = true` (protocol version 2) relay шифруется ChaCha20-Poly1305 (`src/sgfb_crypto.rs`).
 
 ## Конфигурация Front
 

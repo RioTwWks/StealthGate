@@ -443,7 +443,7 @@ pub fn resolve_fingerprint_alias(profile: &str) -> String {
   }
 }
 
-#[cfg(test)]
+#[doc(hidden)]
 pub mod test_support {
   /// Собирает минимальный TLS ClientHello с SNI для unit-тестов.
   pub fn build_client_hello(sni: &str) -> Vec<u8> {

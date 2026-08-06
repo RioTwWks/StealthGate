@@ -1,8 +1,10 @@
 //! Front/Back split — разделение edge (front) и Telegram relay (back).
 
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -14,14 +16,17 @@ use crate::error::{Result, StealthGateError};
 use crate::faketls::FakeTlsStream;
 use crate::io_util::PrefixedStream;
 use crate::mtproto_obfuscate::{self, ObfuscatedStream};
+use crate::drs;
 use crate::proxy;
+use crate::sgfb_crypto::{self, EncryptedStream, SessionKeys};
 use crate::state::AppState;
 
 const MAGIC: &[u8; 4] = b"SGFB";
-const VERSION: u8 = 1;
+const VERSION_PLAIN: u8 = sgfb_crypto::PROTOCOL_VERSION_PLAIN;
+const VERSION_ENCRYPTED: u8 = sgfb_crypto::PROTOCOL_VERSION_ENCRYPTED;
 const MAX_BACKEND_LEN: usize = 256;
 const MAX_INITIAL_LEN: usize = 65_536;
-const ACK_OK: u8 = 0;
+pub const ACK_OK: u8 = 0;
 const ACK_ERR: u8 = 1;
 
 /// Метаданные opening-кадра Front → Back.
@@ -44,6 +49,7 @@ pub fn encode_opening_frame(
   secret_mode: SecretMode,
   backend: &str,
   initial_data: &[u8],
+  encrypt_relay: bool,
 ) -> Result<Vec<u8>> {
   if backend.len() > MAX_BACKEND_LEN {
     return Err(StealthGateError::Config(format!(
@@ -58,7 +64,11 @@ pub fn encode_opening_frame(
 
   let mut out = Vec::with_capacity(44 + backend.len() + initial_data.len());
   out.extend_from_slice(MAGIC);
-  out.push(VERSION);
+  out.push(if encrypt_relay {
+    VERSION_ENCRYPTED
+  } else {
+    VERSION_PLAIN
+  });
   out.extend_from_slice(&hash_auth_token(token));
   out.push(secret_mode_to_byte(secret_mode));
   out.extend_from_slice(&(backend.len() as u16).to_be_bytes());
@@ -76,7 +86,7 @@ pub fn decode_opening_frame(data: &[u8]) -> Result<SplitOpeningFrame> {
   if &data[0..4] != MAGIC {
     return Err(StealthGateError::Proxy("неверный split magic".into()));
   }
-  if data[4] != VERSION {
+  if data[4] != VERSION_PLAIN && data[4] != VERSION_ENCRYPTED {
     return Err(StealthGateError::Proxy(format!(
       "неподдерживаемая split version: {}",
       data[4]
@@ -198,6 +208,88 @@ async fn prepare_ee_client_hello<C: AsyncRead + AsyncWrite + Unpin>(
   Ok((buf, client_hello))
 }
 
+fn opening_frame_encrypted(frame_bytes: &[u8]) -> bool {
+  frame_bytes.get(4).copied() == Some(VERSION_ENCRYPTED)
+}
+
+fn wrap_relay_stream<S>(
+  stream: S,
+  keys: SessionKeys,
+  encrypted: bool,
+  client_side: bool,
+) -> EitherRelayStream<S> {
+  if encrypted {
+    if client_side {
+      EitherRelayStream::Encrypted(EncryptedStream::client_side(stream, keys))
+    } else {
+      EitherRelayStream::Encrypted(EncryptedStream::server_side(stream, keys))
+    }
+  } else {
+    EitherRelayStream::Plain(stream)
+  }
+}
+
+enum EitherRelayStream<S> {
+  Plain(S),
+  Encrypted(EncryptedStream<S>),
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for EitherRelayStream<S> {
+  fn poll_read(
+    mut self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    buf: &mut tokio::io::ReadBuf<'_>,
+  ) -> Poll<std::io::Result<()>> {
+    match &mut *self {
+      EitherRelayStream::Plain(inner) => Pin::new(inner).poll_read(cx, buf),
+      EitherRelayStream::Encrypted(inner) => Pin::new(inner).poll_read(cx, buf),
+    }
+  }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for EitherRelayStream<S> {
+  fn poll_write(
+    mut self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    buf: &[u8],
+  ) -> Poll<std::io::Result<usize>> {
+    match &mut *self {
+      EitherRelayStream::Plain(inner) => Pin::new(inner).poll_write(cx, buf),
+      EitherRelayStream::Encrypted(inner) => Pin::new(inner).poll_write(cx, buf),
+    }
+  }
+
+  fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    match &mut *self {
+      EitherRelayStream::Plain(inner) => Pin::new(inner).poll_flush(cx),
+      EitherRelayStream::Encrypted(inner) => Pin::new(inner).poll_flush(cx),
+    }
+  }
+
+  fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    match &mut *self {
+      EitherRelayStream::Plain(inner) => Pin::new(inner).poll_shutdown(cx),
+      EitherRelayStream::Encrypted(inner) => Pin::new(inner).poll_shutdown(cx),
+    }
+  }
+}
+
+async fn relay_streams<S1, S2>(
+  client_io: S1,
+  back_io: S2,
+  drs: &crate::config::DrsConfig,
+) -> Result<(u64, u64)>
+where
+  S1: AsyncRead + AsyncWrite + Unpin,
+  S2: AsyncRead + AsyncWrite + Unpin,
+{
+  if drs.ee_relay {
+    drs::copy_bidirectional_shaped(client_io, back_io, drs).await
+  } else {
+    proxy::copy_bidirectional(client_io, back_io).await
+  }
+}
+
 /// Front: проксирует MTProto-сессию на back-узел.
 pub async fn relay_from_front<C>(
   mut client: C,
@@ -211,6 +303,15 @@ pub async fn relay_from_front<C>(
 where
   C: AsyncRead + AsyncWrite + Unpin,
 {
+  let drs = {
+    let config = state
+      .config
+      .read()
+      .map_err(|_| StealthGateError::Config("блокировка config poisoned".into()))?;
+    config.drs.clone()
+  };
+  let write_opts = crate::faketls::FakeTlsWriteOptions::from_drs(&drs);
+
   // Для ee: ServerHello на front, handshake читается параллельно connect к back
   // (как monolith ждёт DC connect перед accept_handshake), затем SGFB initial_data.
   enum FrontRelay<C> {
@@ -233,7 +334,10 @@ where
     let tls_tail_bytes = tls_tail.len();
     let timeout = Duration::from_secs(split.connect_timeout_secs);
     let first_back = split.back_servers.first().cloned();
-    let mut tls_io = FakeTlsStream::new(PrefixedStream::new(tls_tail, client));
+    let mut tls_io = FakeTlsStream::with_write_options(
+      PrefixedStream::new(tls_tail, client),
+      write_opts.clone(),
+    );
 
     let (handshake, obf2_prefix, tls_io, preconnect) = if let Some(back_addr) = first_back {
       let (io_result, preconnect) = tokio::join!(
@@ -315,7 +419,15 @@ where
     ));
   }
 
-  let frame = encode_opening_frame(token, secret_mode, preferred_backend, &sgfb_initial)?;
+  let frame = encode_opening_frame(
+    token,
+    secret_mode,
+    preferred_backend,
+    &sgfb_initial,
+    split.encrypt_relay,
+  )?;
+  let session_keys = sgfb_crypto::derive_session_keys(token, &frame);
+  let relay_encrypted = split.encrypt_relay && opening_frame_encrypted(&frame);
   let timeout = Duration::from_secs(split.connect_timeout_secs);
   let mut last_error = None;
   let mut preconnected_back = preconnected_back;
@@ -373,6 +485,8 @@ where
         match ack_result {
           Ok(()) => {
             state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
+            let back_io =
+              wrap_relay_stream(back_stream, session_keys.clone(), relay_encrypted, true);
             let (c2b, b2c) = match front_relay {
               FrontRelay::EePlain {
                 obf2_prefix,
@@ -380,14 +494,15 @@ where
               } => {
                 tracing::debug!(
                   obf2_prefix_bytes = obf2_prefix.len(),
-                  "split front ee: ACK получен, старт plaintext obfuscated2 relay"
+                  encrypted = relay_encrypted,
+                  "split front ee: ACK получен, старт obfuscated2 relay"
                 );
                 let client_io = PrefixedStream::new(obf2_prefix, tls_io);
-                proxy::copy_bidirectional(client_io, back_stream).await?
+                relay_streams(client_io, back_io, &drs).await?
               }
               FrontRelay::Plain { initial, client } => {
                 let client_io = PrefixedStream::new(initial, client);
-                proxy::copy_bidirectional(client_io, back_stream).await?
+                relay_streams(client_io, back_io, &drs).await?
               }
             };
             state
@@ -538,13 +653,15 @@ async fn handle_back_ee_connection<S>(
   peer_ip: IpAddr,
   frame: SplitOpeningFrame,
   state: &AppState,
+  relay_encrypted: bool,
+  session_keys: SessionKeys,
 ) -> Result<()>
 where
   S: AsyncRead + AsyncWrite + Unpin,
 {
   let secret = proxy::resolve_secret_bytes(state, None)?;
 
-  let relay_dc_id = if frame.initial_data.len() == mtproto_obfuscate::HANDSHAKE_LEN {
+  let (relay_dc_id, proto_tag) = if frame.initial_data.len() == mtproto_obfuscate::HANDSHAKE_LEN {
     let handshake: [u8; mtproto_obfuscate::HANDSHAKE_LEN] = frame
       .initial_data
       .as_slice()
@@ -561,9 +678,12 @@ where
         "невалидный obfuscated2 handshake в initial_data".into(),
       ));
     }
-    mtproto_obfuscate::handshake_dc_index(&handshake, &secret)
+    let proto_tag = mtproto_obfuscate::handshake_proto_tag(&handshake, &secret)
+      .ok_or_else(|| StealthGateError::Proxy("не удалось извлечь proto tag".into()))?;
+    let dc_id = mtproto_obfuscate::handshake_dc_index(&handshake, &secret)
       .filter(|&id| id != 0)
-      .unwrap_or_else(|| mtproto_obfuscate::dc_id_from_backend(&frame.backend))
+      .unwrap_or_else(|| mtproto_obfuscate::dc_id_from_backend(&frame.backend));
+    (dc_id, proto_tag)
   } else {
     send_ack(
       &mut front_stream,
@@ -615,12 +735,8 @@ where
     );
   }
 
-  // Как в monolith relay_ee_streams: accept_handshake → relay init → ACK → copy.
-  let prefixed = PrefixedStream::new(frame.initial_data, front_stream);
-  let mut accepted = mtproto_obfuscate::accept_handshake(prefixed, &secret).await?;
-
-  let (header, relay_keys) =
-    mtproto_obfuscate::generate_relay_init(relay_dc_id, accepted.proto_tag)?;
+  // relay init → plaintext ACK → encrypted relay (SGFB v2).
+  let (header, relay_keys) = mtproto_obfuscate::generate_relay_init(relay_dc_id, proto_tag)?;
   upstream
     .write_all(&header)
     .await
@@ -633,13 +749,18 @@ where
   tracing::debug!(
     %peer_ip,
     relay_dc_id,
-    proto_tag = %hex::encode(accepted.proto_tag),
+    proto_tag = %hex::encode(proto_tag),
     backend = %connected_backend,
-    "split back ee: relay init в DC, ACK front для старта obfuscated2 relay"
+    encrypted = relay_encrypted,
+    "split back ee: relay init в DC, plaintext ACK front"
   );
 
-  send_ack(accepted.stream.inner_mut(), true, None).await?;
+  send_ack(&mut front_stream, true, None).await?;
   state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
+
+  let front_io = wrap_relay_stream(front_stream, session_keys, relay_encrypted, false);
+  let prefixed = PrefixedStream::new(frame.initial_data, front_io);
+  let accepted = mtproto_obfuscate::accept_handshake(prefixed, &secret).await?;
 
   let dc_stream = ObfuscatedStream::from_relay_keys(upstream, relay_keys);
   let (c2b, b2c) = proxy::copy_bidirectional(accepted.stream, dc_stream).await?;
@@ -705,16 +826,28 @@ where
     return Err(StealthGateError::Proxy("неверный split auth_token".into()));
   }
 
+  let relay_encrypted = split.encrypt_relay && opening_frame_encrypted(&raw);
+  let session_keys = sgfb_crypto::derive_session_keys(token, &raw);
+
   tracing::info!(
     %peer_ip,
     backend = %frame.backend,
     secret_mode = ?frame.secret_mode,
     initial_bytes = frame.initial_data.len(),
+    encrypted = relay_encrypted,
     "split back: принят SGFB opening-кадр, подключение к Telegram DC"
   );
 
   if frame.secret_mode == SecretMode::Ee {
-    return handle_back_ee_connection(front_stream, peer_ip, frame, state).await;
+    return handle_back_ee_connection(
+      front_stream,
+      peer_ip,
+      frame,
+      state,
+      relay_encrypted,
+      session_keys,
+    )
+    .await;
   }
 
   let (fragmentation, drs, dd, webhooks, network) = {
@@ -793,7 +926,8 @@ where
     .bytes_to_backend
     .fetch_add(frame.initial_data.len() as u64, Ordering::Relaxed);
 
-  let (c2b, b2c) = proxy::copy_bidirectional(front_stream, upstream).await?;
+  let front_io = wrap_relay_stream(front_stream, session_keys, relay_encrypted, false);
+  let (c2b, b2c) = proxy::copy_bidirectional(front_io, upstream).await?;
   state.stats.bytes_to_backend.fetch_add(c2b, Ordering::Relaxed);
   state.stats.bytes_from_backend.fetch_add(b2c, Ordering::Relaxed);
 
@@ -864,7 +998,7 @@ mod tests {
     let backend = "149.154.167.99:443";
     let initial = b"hello-mtproto";
     let encoded =
-      encode_opening_frame(token, SecretMode::Ee, backend, initial).expect("encode");
+      encode_opening_frame(token, SecretMode::Ee, backend, initial, true).expect("encode");
     let decoded = decode_opening_frame(&encoded).expect("decode");
     assert_eq!(decoded.secret_mode, SecretMode::Ee);
     assert_eq!(decoded.backend, backend);
@@ -872,8 +1006,19 @@ mod tests {
   }
 
   #[test]
+  fn opening_frame_v2_marks_encrypted_protocol() {
+    let token = "shared-secret-token-1234";
+    let encoded = encode_opening_frame(token, SecretMode::Ee, "1.1.1.1:443", b"hs", true)
+      .expect("encode");
+    assert_eq!(encoded[4], sgfb_crypto::PROTOCOL_VERSION_ENCRYPTED);
+    let plain = encode_opening_frame(token, SecretMode::Ee, "1.1.1.1:443", b"hs", false)
+      .expect("encode");
+    assert_eq!(plain[4], sgfb_crypto::PROTOCOL_VERSION_PLAIN);
+  }
+
+  #[test]
   fn rejects_bad_magic() {
-    let mut data = encode_opening_frame("token", SecretMode::Classic, "1.1.1.1:443", b"x")
+    let mut data = encode_opening_frame("token", SecretMode::Classic, "1.1.1.1:443", b"x", false)
       .expect("encode");
     data[0] = b'X';
     assert!(decode_opening_frame(&data).is_err());
@@ -913,7 +1058,7 @@ mod tests {
     });
 
     let mut client = TcpStream::connect(addr).await.expect("connect");
-    let frame = encode_opening_frame(token, SecretMode::Ee, "149.154.167.99:443", b"payload")
+    let frame = encode_opening_frame(token, SecretMode::Ee, "149.154.167.99:443", b"payload", true)
       .expect("encode");
     client.write_all(&frame).await.expect("write");
     let mut ack = [0u8; 1];

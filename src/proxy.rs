@@ -130,10 +130,14 @@ pub async fn proxy_mtproto_ee(
   }
 
   let (c2s, s2c) = relay_ee_streams(
-    FakeTlsStream::new(client),
+    FakeTlsStream::with_write_options(
+      client,
+      crate::faketls::FakeTlsWriteOptions::from_drs(options.drs),
+    ),
     upstream,
     &secret,
     options.preferred_backend,
+    options.drs,
   )
   .await?;
 
@@ -163,6 +167,7 @@ pub async fn relay_ee_streams<C, U>(
   mut upstream: U,
   secret: &[u8],
   preferred_backend: &str,
+  drs: &DrsConfig,
 ) -> Result<(u64, u64)>
 where
   C: AsyncRead + AsyncWrite + Unpin,
@@ -186,7 +191,11 @@ where
     .map_err(|err| StealthGateError::Proxy(format!("ee relay flush to DC: {err}")))?;
 
   let dc_stream = ObfuscatedStream::from_relay_keys(upstream, relay_keys);
-  copy_bidirectional(accepted.stream, dc_stream).await
+  if drs.ee_relay {
+    drs::copy_bidirectional_shaped(accepted.stream, dc_stream, drs).await
+  } else {
+    copy_bidirectional(accepted.stream, dc_stream).await
+  }
 }
 
 /// Мост ee Fake TLS → уже инициализированный obfuscated2-поток к DC (relay init уже отправлен).

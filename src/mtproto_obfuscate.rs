@@ -429,7 +429,7 @@ const RESERVED_STARTS: &[[u8; 4]] = &[
 ];
 const RESERVED_CONTINUE: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
 
-#[cfg(test)]
+#[doc(hidden)]
 pub fn generate_test_handshake(secret: &[u8], dc_idx: i16, proto_tag: [u8; 4]) -> [u8; HANDSHAKE_LEN] {
   let dc_bytes = dc_idx.to_le_bytes();
   loop {

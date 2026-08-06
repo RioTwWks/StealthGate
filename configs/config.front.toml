@@ -23,6 +23,7 @@ mode = "front"
 auth_token = "change-me-front-back-token"
 back_servers = ["10.0.0.2:8444", "10.0.0.3:8444"]
 connect_timeout_secs = 10
+encrypt_relay = true
 
 [fallback]
 static_html = "web/index.html"
@@ -32,6 +33,12 @@ fronting_port = 443
 [fragmentation]
 enabled = true
 chunk_sizes = [1, 2, 3, 2, 1]
+
+[drs]
+enabled = true
+ee_relay = true
+record_sizes = [512, 1024, 1398, 256]
+jitter_ms = 15
 
 [security]
 antireplay_cache_size = 65536

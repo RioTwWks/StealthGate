@@ -23,6 +23,7 @@ fn split_opening_frame_contains_token_hash() {
     SecretMode::Ee,
     "149.154.167.99:443",
     b"payload",
+    true,
   )
   .expect("encode");
   assert_eq!(&frame[5..37], hash_auth_token(AUTH_TOKEN));
@@ -73,6 +74,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
     SecretMode::Classic,
     "127.0.0.1:443",
     b"x",
+    true,
   )
   .expect("encode");
   front.write_all(&bad_frame).await.expect("write");

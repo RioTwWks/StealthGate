@@ -369,6 +369,10 @@ async fn handle_fallback_path(
     .await;
   }
 
+  if looks_like_tls_client_hello(&peek_buf) {
+    return crate::decoy_tls::serve_decoy(client, &peek_buf).await;
+  }
+
   fallback::handle_fallback(
     client,
     &peek_buf,

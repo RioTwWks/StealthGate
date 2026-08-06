@@ -280,6 +280,16 @@ pub struct DrsConfig {
   pub enabled: bool,
   #[serde(default = "default_drs_sizes")]
   pub record_sizes: Vec<usize>,
+  /// DRS + jitter на ee Fake TLS relay (client ↔ front / monolith ee).
+  #[serde(default = "default_ee_relay")]
+  pub ee_relay: bool,
+  /// Максимальная случайная задержка между DRS-чанками (мс).
+  #[serde(default)]
+  pub jitter_ms: u64,
+}
+
+fn default_ee_relay() -> bool {
+  true
 }
 
 fn default_drs_sizes() -> Vec<usize> {
@@ -291,6 +301,8 @@ impl Default for DrsConfig {
     Self {
       enabled: false,
       record_sizes: default_drs_sizes(),
+      ee_relay: default_ee_relay(),
+      jitter_ms: 0,
     }
   }
 }
@@ -465,6 +477,13 @@ pub struct SplitConfig {
   pub front_allowlist: Vec<String>,
   #[serde(default = "default_split_timeout")]
   pub connect_timeout_secs: u64,
+  /// Шифровать SGFB relay ChaCha20-Poly1305 (protocol version 2).
+  #[serde(default = "default_split_encrypt_relay")]
+  pub encrypt_relay: bool,
+}
+
+fn default_split_encrypt_relay() -> bool {
+  true
 }
 
 fn default_split_timeout() -> u64 {
@@ -481,6 +500,7 @@ impl Default for SplitConfig {
       back_listen_port: None,
       front_allowlist: Vec::new(),
       connect_timeout_secs: default_split_timeout(),
+      encrypt_relay: default_split_encrypt_relay(),
     }
   }
 }
