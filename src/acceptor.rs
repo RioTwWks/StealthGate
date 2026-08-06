@@ -28,7 +28,7 @@ use crate::tls::{
 use crate::tls_server;
 
 const PEEK_BUFFER_SIZE: usize = 4096;
-const PEEK_READ_TIMEOUT: Duration = Duration::from_millis(500);
+const PEEK_READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Читает начальный буфер, дочитывая неполные TLS-записи (крупный ee ClientHello).
 async fn read_initial_peek(client: &mut TcpStream) -> Result<Vec<u8>> {
