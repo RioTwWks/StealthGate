@@ -638,11 +638,32 @@ fn peer_allowed(peer_ip: IpAddr, allowlist: &[String]) -> bool {
   })
 }
 
+async fn read_front_obf2_prefix<S>(stream: &mut S, timeout: Duration) -> Result<Vec<u8>>
+where
+  S: AsyncRead + Unpin,
+{
+  let mut buf = vec![0u8; 8192];
+  let n = tokio::time::timeout(timeout, stream.read(&mut buf))
+    .await
+    .map_err(|_| {
+      StealthGateError::Proxy("split back ee: timeout ожидания obf2 от front".into())
+    })?
+    .map_err(|err| StealthGateError::Proxy(format!("split back ee: read obf2 от front: {err}")))?;
+  if n == 0 {
+    return Err(StealthGateError::Proxy(
+      "split back ee: front закрыл соединение до obf2 данных".into(),
+    ));
+  }
+  buf.truncate(n);
+  Ok(buf)
+}
+
 async fn handle_back_ee_connection<S>(
   mut front_stream: S,
   peer_ip: IpAddr,
   frame: SplitOpeningFrame,
   state: &AppState,
+  split: &SplitConfig,
   relay_encrypted: bool,
   session_keys: SessionKeys,
 ) -> Result<()>
@@ -686,6 +707,15 @@ where
     ));
   };
 
+  let timeout = Duration::from_secs(split.connect_timeout_secs);
+
+  // ACK сразу — front может начать SGFB relay, пока back подключается к DC.
+  send_ack(&mut front_stream, true, None).await?;
+
+  let front_io = wrap_relay_stream(front_stream, session_keys, relay_encrypted, false);
+  let prefixed = PrefixedStream::new(frame.initial_data, front_io);
+  let accepted = mtproto_obfuscate::accept_handshake(prefixed, &secret).await?;
+
   let network = {
     let config = state
       .config
@@ -700,22 +730,23 @@ where
     .map_err(|_| StealthGateError::Config("блокировка backend_pool poisoned".into()))?
     .clone();
 
-  let (mut upstream, connected_backend) = match pool
-    .connect(&network, Some(&frame.backend), &state.stats)
-    .await
-  {
-    Ok(value) => value,
-    Err(err) => {
+  let mut client_stream = accepted.stream;
+  let backend = frame.backend.clone();
+  let ((mut upstream, connected_backend), obf2_prefix) = tokio::try_join!(
+    pool.connect(&network, Some(&backend), &state.stats),
+    read_front_obf2_prefix(&mut client_stream, timeout)
+  )
+  .map_err(|err| {
+    if let StealthGateError::Proxy(msg) = &err {
       tracing::warn!(
         %peer_ip,
         backend = %frame.backend,
-        error = %err,
-        "split back ee: не удалось подключиться к Telegram DC"
+        error = %msg,
+        "split back ee: не удалось подготовить relay (DC или obf2 от front)"
       );
-      send_ack(&mut front_stream, false, Some(&err.to_string())).await?;
-      return Err(err);
     }
-  };
+    err
+  })?;
 
   if connected_backend != frame.backend {
     tracing::info!(
@@ -725,13 +756,7 @@ where
     );
   }
 
-  // Как monolith relay_ee_streams: ACK → encrypt → accept_handshake → relay init → copy.
-  send_ack(&mut front_stream, true, None).await?;
-
-  let front_io = wrap_relay_stream(front_stream, session_keys, relay_encrypted, false);
-  let prefixed = PrefixedStream::new(frame.initial_data, front_io);
-  let accepted = mtproto_obfuscate::accept_handshake(prefixed, &secret).await?;
-
+  // relay init только после первых obf2-данных от front (как monolith: handshake → данные → DC).
   let (header, relay_keys) = mtproto_obfuscate::generate_relay_init(relay_dc_id, proto_tag)?;
   upstream
     .write_all(&header)
@@ -747,14 +772,16 @@ where
     relay_dc_id,
     proto_tag = %hex::encode(proto_tag),
     backend = %connected_backend,
+    obf2_prefix_bytes = obf2_prefix.len(),
     encrypted = relay_encrypted,
-    "split back ee: accept_handshake + relay init, старт copy"
+    "split back ee: obf2 от front получен, relay init в DC, старт copy"
   );
 
   state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
 
+  let client_io = PrefixedStream::new(obf2_prefix, client_stream);
   let dc_stream = ObfuscatedStream::from_relay_keys(upstream, relay_keys);
-  let (c2b, b2c) = proxy::copy_bidirectional_graceful(accepted.stream, dc_stream).await?;
+  let (c2b, b2c) = proxy::copy_bidirectional_graceful(client_io, dc_stream).await?;
   state
     .stats
     .bytes_to_backend
@@ -835,6 +862,7 @@ where
       peer_ip,
       frame,
       state,
+      split,
       relay_encrypted,
       session_keys,
     )
