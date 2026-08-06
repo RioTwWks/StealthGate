@@ -185,7 +185,7 @@ where
             tracing::trace!(
               bytes = n,
               total_buffered = buffered.len() + n,
-              "split front: буфер TLS во время ожидания ACK"
+              "split front: буфер obfuscated2 во время ожидания ACK"
             );
             buffered.extend_from_slice(&buf[..n]);
           }
@@ -213,16 +213,15 @@ pub async fn relay_from_front<C>(
 where
   C: AsyncRead + AsyncWrite + Unpin,
 {
-  // Для ee: TLS завершается на front (ServerHello), дальше raw TLS байты туннелируются
-  // в SGFB без разбора — obfuscated2 handshake читает back через FakeTlsStream.
+  // Для ee: TLS завершается на front (ServerHello), 64-байтный obfuscated2 handshake
+  // уходит в SGFB initial_data, дальше между front и back — plaintext obfuscated2.
   enum FrontRelay<C> {
     Plain {
       initial: Vec<u8>,
       client: C,
     },
-    EeTls {
-      tls_tail: Vec<u8>,
-      client: C,
+    EePlain {
+      tls_io: FakeTlsStream<PrefixedStream<C>>,
     },
   }
 
@@ -255,16 +254,25 @@ where
     server_hello_result?;
 
     let tls_tail = initial_data[client_hello.raw.len()..].to_vec();
+    let mut tls_io = FakeTlsStream::new(PrefixedStream::new(tls_tail, client));
+    let mut handshake = [0u8; mtproto_obfuscate::HANDSHAKE_LEN];
+    tls_io
+      .read_exact(&mut handshake)
+      .await
+      .map_err(|err| StealthGateError::Proxy(format!("split front ee handshake: {err}")))?;
+    mtproto_obfuscate::parse_handshake(&handshake, &secret).ok_or_else(|| {
+      StealthGateError::Proxy("split front: невалидный obfuscated2 handshake".into())
+    })?;
     tracing::debug!(
       sni = ?client_hello.sni,
-      tls_tail_bytes = tls_tail.len(),
+      handshake_bytes = handshake.len(),
       preconnected = preconnect.is_some(),
-      "split front: отправлен fake TLS ServerHello, дальше raw TLS туннель в SGFB"
+      "split front: прочитан obfuscated2 handshake, передаём в SGFB initial_data"
     );
 
     (
-      Vec::new(),
-      FrontRelay::EeTls { tls_tail, client },
+      handshake.to_vec(),
+      FrontRelay::EePlain { tls_io },
       preconnect,
     )
   } else {
@@ -326,8 +334,8 @@ where
         }
 
         let ack_result = match &mut front_relay {
-          FrontRelay::EeTls { client, .. } => {
-            wait_split_ack_while_buffering(&mut back_stream, client, timeout).await
+          FrontRelay::EePlain { tls_io } => {
+            wait_split_ack_while_buffering(&mut back_stream, tls_io, timeout).await
           }
           FrontRelay::Plain { .. } => {
             let mut ack = [0u8; 1];
@@ -355,13 +363,12 @@ where
           Ok(buffered_tls) => {
             state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
             let (c2b, b2c) = match front_relay {
-              FrontRelay::EeTls { mut tls_tail, client } => {
-                tls_tail.extend(buffered_tls);
+              FrontRelay::EePlain { tls_io } => {
                 tracing::debug!(
-                  tls_prefix_bytes = tls_tail.len(),
-                  "split front ee: ACK получен, старт raw TLS туннеля"
+                  obf2_prefix_bytes = buffered_tls.len(),
+                  "split front ee: ACK получен, старт plaintext obfuscated2 relay"
                 );
-                let client_io = PrefixedStream::new(tls_tail, client);
+                let client_io = PrefixedStream::new(buffered_tls, tls_io);
                 proxy::copy_bidirectional(client_io, back_stream).await?
               }
               FrontRelay::Plain { initial, client } => {
@@ -521,24 +528,38 @@ async fn handle_back_ee_connection<S>(
 where
   S: AsyncRead + AsyncWrite + Unpin,
 {
-  if !frame.initial_data.is_empty() {
-    tracing::warn!(
-      %peer_ip,
-      initial_bytes = frame.initial_data.len(),
-      "split back ee: ненулевой initial_data устарел, ожидается raw TLS после ACK"
-    );
+  let secret = proxy::resolve_secret_bytes(state, None)?;
+  if frame.initial_data.len() != mtproto_obfuscate::HANDSHAKE_LEN {
     send_ack(
       &mut front_stream,
       false,
-      Some("ee split: обновите front — initial_data должен быть пустым"),
+      Some("ee initial_data должен быть 64-байтным obfuscated2 handshake"),
     )
     .await?;
     return Err(StealthGateError::Proxy(
-      "ee split: ненулевой initial_data, нужен raw TLS туннель".into(),
+      "ee initial_data должен быть 64-байтным obfuscated2 handshake".into(),
+    ));
+  }
+  let handshake: [u8; mtproto_obfuscate::HANDSHAKE_LEN] = frame
+    .initial_data
+    .as_slice()
+    .try_into()
+    .expect("handshake len checked");
+  if mtproto_obfuscate::parse_handshake(&handshake, &secret).is_none() {
+    send_ack(
+      &mut front_stream,
+      false,
+      Some("невалидный obfuscated2 handshake в initial_data"),
+    )
+    .await?;
+    return Err(StealthGateError::Proxy(
+      "невалидный obfuscated2 handshake в initial_data".into(),
     ));
   }
 
-  let secret = proxy::resolve_secret_bytes(state, None)?;
+  let relay_dc_id = mtproto_obfuscate::handshake_dc_index(&handshake, &secret)
+    .filter(|&id| id != 0)
+    .unwrap_or_else(|| mtproto_obfuscate::dc_id_from_backend(&frame.backend));
 
   let network = {
     let config = state
@@ -579,7 +600,6 @@ where
     );
   }
 
-  let relay_dc_id = mtproto_obfuscate::dc_id_from_backend(&frame.backend);
   let (header, relay_keys) = mtproto_obfuscate::generate_relay_init(relay_dc_id)?;
   upstream
     .write_all(&header)
@@ -590,24 +610,20 @@ where
     %peer_ip,
     relay_dc_id,
     backend = %connected_backend,
-    "split back ee: relay init в DC, ACK front для старта TLS-туннеля"
+    "split back ee: relay init в DC, ACK front для старта obfuscated2 relay"
   );
 
-  // ACK после relay init — front начинает raw TLS туннель, DC уже готов.
   send_ack(&mut front_stream, true, None).await?;
   state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
 
+  let prefixed = PrefixedStream::new(frame.initial_data, front_stream);
+  let accepted = mtproto_obfuscate::accept_handshake(prefixed, &secret).await?;
   let dc_stream = ObfuscatedStream::from_relay_keys(upstream, relay_keys);
-  let (c2b, b2c) = proxy::relay_ee_to_prepared_dc(
-    FakeTlsStream::new(front_stream),
-    dc_stream,
-    &secret,
-  )
-  .await?;
+  let (c2b, b2c) = proxy::copy_bidirectional(accepted.stream, dc_stream).await?;
   state
     .stats
     .bytes_to_backend
-    .fetch_add(c2b, Ordering::Relaxed);
+    .fetch_add(c2b + mtproto_obfuscate::HANDSHAKE_LEN as u64, Ordering::Relaxed);
   state.stats.bytes_from_backend.fetch_add(b2c, Ordering::Relaxed);
   tracing::debug!(
     backend = %connected_backend,
