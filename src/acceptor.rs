@@ -1,6 +1,7 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::io::AsyncReadExt;
@@ -20,10 +21,60 @@ use crate::metrics;
 use crate::proxy;
 use crate::split;
 use crate::state::AppState;
-use crate::tls::{compute_ja4, ja4_matches_any, looks_like_tls_client_hello, parse_client_hello, parse_record};
+use crate::tls::{
+  compute_ja4, ja4_matches_any, looks_like_tls_client_hello, parse_client_hello, parse_record,
+  tls_record_total_len,
+};
 use crate::tls_server;
 
 const PEEK_BUFFER_SIZE: usize = 4096;
+const PEEK_READ_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Читает начальный буфер, дочитывая неполные TLS-записи (крупный ee ClientHello).
+async fn read_initial_peek(client: &mut TcpStream) -> Result<Vec<u8>> {
+  let mut buf = vec![0u8; PEEK_BUFFER_SIZE];
+  let n = client
+    .read(&mut buf)
+    .await
+    .map_err(|err| StealthGateError::Proxy(format!("чтение начальных данных: {err}")))?;
+  if n == 0 {
+    return Ok(Vec::new());
+  }
+  let mut total = n;
+
+  if let Some(needed) = tls_record_total_len(&buf[..total]) {
+    if needed > PEEK_BUFFER_SIZE {
+      return Err(StealthGateError::Proxy(format!(
+        "TLS-запись слишком большая для peek: {needed} > {PEEK_BUFFER_SIZE}"
+      )));
+    }
+    while total < needed {
+      let to_read = (needed - total).min(PEEK_BUFFER_SIZE - total);
+      match tokio::time::timeout(PEEK_READ_TIMEOUT, client.read(&mut buf[total..total + to_read]))
+        .await
+      {
+        Ok(Ok(0)) => break,
+        Ok(Ok(n)) => total += n,
+        Ok(Err(err)) => {
+          return Err(StealthGateError::Proxy(format!(
+            "дочитывание TLS-записи: {err}"
+          )));
+        }
+        Err(_) => break,
+      }
+    }
+    if total < needed {
+      tracing::debug!(
+        peek_len = total,
+        needed,
+        "неполная TLS-запись после таймаута дочитывания"
+      );
+    }
+  }
+
+  buf.truncate(total);
+  Ok(buf)
+}
 
 struct ConnectionContext {
   fake_domains: Vec<String>,
@@ -47,17 +98,11 @@ pub async fn handle_connection(mut client: TcpStream, state: Arc<AppState>) -> R
 
   state.stats.total_connections.fetch_add(1, Ordering::Relaxed);
 
-  let mut peek_buf = vec![0u8; PEEK_BUFFER_SIZE];
-  let n = client
-    .read(&mut peek_buf)
-    .await
-    .map_err(|err| StealthGateError::Proxy(format!("чтение начальных данных: {err}")))?;
+  let peek_buf = read_initial_peek(&mut client).await?;
 
-  if n == 0 {
+  if peek_buf.is_empty() {
     return Ok(());
   }
-
-  peek_buf.truncate(n);
 
   let ctx = load_connection_context(&state)?;
   let blacklist = state.ip_blacklist()?;

@@ -264,21 +264,37 @@ fn parse_sni_extension(data: &[u8]) -> Option<String> {
   None
 }
 
+/// Возвращает полный размер первой TLS-записи (5 + payload_len) по заголовку.
+pub fn tls_record_total_len(data: &[u8]) -> Option<usize> {
+  if data.len() < 5 {
+    return None;
+  }
+  RecordType::try_from(data[0]).ok()?;
+  let payload_len = u16::from_be_bytes([data[3], data[4]]) as usize;
+  5usize.checked_add(payload_len)
+}
+
 /// Проверяет, похожи ли байты на TLS ClientHello.
 pub fn looks_like_tls_client_hello(data: &[u8]) -> bool {
-  let Ok(record) = parse_record(data) else {
+  if data.len() < 6 {
     return false;
-  };
-
-  if record.record_type != RecordType::Handshake {
+  }
+  if data[0] != RecordType::Handshake as u8 {
+    return false;
+  }
+  if !matches!(
+    HandshakeType::from_byte(data[5]),
+    HandshakeType::ClientHello
+  ) {
     return false;
   }
 
-  if record.payload.is_empty() {
-    return false;
+  if let Ok(record) = parse_record(data) {
+    return !record.payload.is_empty();
   }
 
-  matches!(HandshakeType::from_byte(record.payload[0]), HandshakeType::ClientHello)
+  // Неполная запись — заголовок уже указывает на ClientHello.
+  true
 }
 
 /// Вычисляет JA4-подобный фингерпринт ClientHello для эмуляции/логирования.
@@ -403,6 +419,27 @@ mod tests {
     let ja4 = compute_ja4(&hello);
     assert!(ja4.starts_with('t'));
     assert!(ja4.contains('_'));
+  }
+
+  #[test]
+  fn detects_partial_tls_client_hello() {
+    let data = build_client_hello("www.cloudflare.com");
+    let total = tls_record_total_len(&data).expect("record len");
+    assert!(total > 6);
+    let partial = &data[..total.saturating_sub(1).max(6)];
+    assert!(
+      looks_like_tls_client_hello(partial),
+      "partial ClientHello must be recognized by header"
+    );
+    if partial.len() < total {
+      assert!(parse_record(partial).is_err());
+    }
+  }
+
+  #[test]
+  fn tls_record_total_len_matches_parse() {
+    let data = build_client_hello("example.com");
+    assert_eq!(tls_record_total_len(&data), Some(data.len()));
   }
 
   #[test]
