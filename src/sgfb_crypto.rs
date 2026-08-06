@@ -213,13 +213,12 @@ impl<S: AsyncRead + Unpin> AsyncRead for EncryptedStream<S> {
   }
 }
 
-impl<S: AsyncWrite + Unpin> AsyncWrite for EncryptedStream<S> {
-  fn poll_write(
+impl<S: AsyncWrite + Unpin> EncryptedStream<S> {
+  fn drain_write_pending(
     mut self: Pin<&mut Self>,
     cx: &mut Context<'_>,
-    buf: &[u8],
-  ) -> Poll<std::io::Result<usize>> {
-    if !self.write_pending.is_empty() {
+  ) -> Poll<std::io::Result<()>> {
+    while !self.write_pending.is_empty() {
       let pending = std::mem::take(&mut self.write_pending);
       match Pin::new(&mut self.inner).poll_write(cx, &pending) {
         Poll::Ready(Ok(0)) => {
@@ -231,13 +230,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for EncryptedStream<S> {
         }
         Poll::Ready(Ok(n)) if n < pending.len() => {
           self.write_pending = pending[n..].to_vec();
-          return Poll::Ready(Ok(0));
+          return Poll::Pending;
         }
-        Poll::Ready(Ok(_)) => {
-          if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-          }
-        }
+        Poll::Ready(Ok(_)) => {}
         Poll::Ready(Err(err)) => {
           self.write_pending = pending;
           return Poll::Ready(Err(err));
@@ -247,6 +242,21 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for EncryptedStream<S> {
           return Poll::Pending;
         }
       }
+    }
+    Poll::Ready(Ok(()))
+  }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for EncryptedStream<S> {
+  fn poll_write(
+    mut self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    buf: &[u8],
+  ) -> Poll<std::io::Result<usize>> {
+    match self.as_mut().drain_write_pending(cx) {
+      Poll::Ready(Ok(())) => {}
+      Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+      Poll::Pending => return Poll::Pending,
     }
 
     if buf.is_empty() {
@@ -270,25 +280,28 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for EncryptedStream<S> {
     frame.extend_from_slice(&ciphertext);
     self.write_pending = frame;
 
-    match self.as_mut().poll_write(cx, &[]) {
-      Poll::Ready(Ok(_)) => Poll::Ready(Ok(chunk_end)),
+    match self.as_mut().drain_write_pending(cx) {
+      Poll::Ready(Ok(())) => Poll::Ready(Ok(chunk_end)),
       Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-      Poll::Pending => Poll::Ready(Ok(chunk_end)),
+      Poll::Pending => Poll::Pending,
     }
   }
 
   fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-    if !self.write_pending.is_empty() {
-      match self.as_mut().poll_write(cx, &[]) {
-        Poll::Ready(Ok(_)) => {}
-        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-        Poll::Pending => return Poll::Pending,
-      }
+    match self.as_mut().drain_write_pending(cx) {
+      Poll::Ready(Ok(())) => {}
+      Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+      Poll::Pending => return Poll::Pending,
     }
     Pin::new(&mut self.inner).poll_flush(cx)
   }
 
   fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    match self.as_mut().poll_flush(cx) {
+      Poll::Ready(Ok(())) => {}
+      Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+      Poll::Pending => return Poll::Pending,
+    }
     Pin::new(&mut self.inner).poll_shutdown(cx)
   }
 }

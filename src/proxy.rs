@@ -270,18 +270,26 @@ where
   let (mut right_read, mut right_write) = tokio::io::split(right);
 
   let client_to_server = async {
-    match tokio::io::copy(&mut left_read, &mut right_write).await {
+    let result = match tokio::io::copy(&mut left_read, &mut right_write).await {
       Ok(n) => Ok(n),
       Err(err) if is_benign_copy_error(&err) => Ok(0),
       Err(err) => Err(err),
+    };
+    if result.is_ok() {
+      let _ = right_write.flush().await;
     }
+    result
   };
   let server_to_client = async {
-    match tokio::io::copy(&mut right_read, &mut left_write).await {
+    let result = match tokio::io::copy(&mut right_read, &mut left_write).await {
       Ok(n) => Ok(n),
       Err(err) if is_benign_copy_error(&err) => Ok(0),
       Err(err) => Err(err),
+    };
+    if result.is_ok() {
+      let _ = left_write.flush().await;
     }
+    result
   };
 
   let (c2s, s2c) = tokio::try_join!(client_to_server, server_to_client).map_err(|err| {
