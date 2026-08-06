@@ -31,6 +31,7 @@ type AesCtr256 = Ctr128BE<Aes256>;
 pub struct HandshakeInfo {
   pub dc_id: u16,
   pub is_media: bool,
+  pub proto_tag: [u8; 4],
 }
 
 /// Проверяет, что первые 64 байта — валидный obfuscated2 handshake с данным секретом.
@@ -67,9 +68,13 @@ pub fn parse_handshake(handshake: &[u8; HANDSHAKE_LEN], secret: &[u8]) -> Option
   }
 
   let dc_idx = i16::from_le_bytes([buf[DC_IDX_POS], buf[DC_IDX_POS + 1]]);
+  let proto_tag: [u8; 4] = buf[PROTO_TAG_POS..PROTO_TAG_POS + 4]
+    .try_into()
+    .expect("proto tag len");
   Some(HandshakeInfo {
     dc_id: dc_idx.unsigned_abs(),
     is_media: dc_idx < 0,
+    proto_tag,
   })
 }
 
@@ -99,6 +104,11 @@ pub fn handshake_dc_index(handshake: &[u8; HANDSHAKE_LEN], secret: &[u8]) -> Opt
   Some(i16::from_le_bytes([buf[DC_IDX_POS], buf[DC_IDX_POS + 1]]))
 }
 
+/// Возвращает proto tag из obfuscated2 handshake (для relay init к DC).
+pub fn handshake_proto_tag(handshake: &[u8; HANDSHAKE_LEN], secret: &[u8]) -> Option<[u8; 4]> {
+  parse_handshake(handshake, secret).map(|info| info.proto_tag)
+}
+
 fn is_valid_proto_tag(tag: &[u8]) -> bool {
   tag == PROTO_TAG_ABRIDGED || tag == PROTO_TAG_INTERMEDIATE || tag == PROTO_TAG_SECURE
 }
@@ -119,6 +129,7 @@ pub fn derive_key_with_secret(prekey: &[u8], secret: &[u8]) -> [u8; 32] {
 pub struct AcceptedHandshake<S> {
   pub stream: ObfuscatedStream<S>,
   pub dc_id: i16,
+  pub proto_tag: [u8; 4],
 }
 
 /// Принимает 64-байтный obfuscated2 handshake из потока (например, внутри Fake TLS).
@@ -153,6 +164,9 @@ where
   let mut sink = header;
   dec.apply_keystream(&mut sink);
   let dc_idx = i16::from_le_bytes([sink[DC_IDX_POS], sink[DC_IDX_POS + 1]]);
+  let proto_tag: [u8; 4] = sink[PROTO_TAG_POS..PROTO_TAG_POS + 4]
+    .try_into()
+    .expect("proto tag len");
 
   let _ = info;
 
@@ -170,6 +184,7 @@ where
       pending_write: Vec::new(),
     },
     dc_id: dc_idx,
+    proto_tag,
   })
 }
 
@@ -195,8 +210,15 @@ where
 }
 
 /// Генерирует исходящий 64-байтный handshake для подключения к Telegram DC (без секрета).
-pub fn generate_relay_init(dc_id: i16) -> crate::error::Result<([u8; HANDSHAKE_LEN], RelayKeys)> {
-  let proto_tag = PROTO_TAG_SECURE;
+pub fn generate_relay_init(
+  dc_id: i16,
+  proto_tag: [u8; 4],
+) -> crate::error::Result<([u8; HANDSHAKE_LEN], RelayKeys)> {
+  if !is_valid_proto_tag(&proto_tag) {
+    return Err(crate::error::StealthGateError::Proxy(
+      "невалидный proto tag для relay init".into(),
+    ));
+  }
   let dc_bytes = dc_id.to_le_bytes();
 
   loop {
@@ -478,6 +500,19 @@ mod tests {
     let secret = hex::decode("0123456789abcdef0123456789abcdef").expect("secret");
     let noise = vec![0u8; 128];
     assert!(!matches_obfuscated2(&noise, &secret));
+  }
+
+  #[test]
+  fn relay_init_accepts_client_proto_tags() {
+    for tag in [PROTO_TAG_SECURE, PROTO_TAG_INTERMEDIATE, PROTO_TAG_ABRIDGED] {
+      let (header, keys) = generate_relay_init(2, tag).expect("relay");
+      assert_eq!(header.len(), HANDSHAKE_LEN);
+      let _ = keys;
+    }
+    let secret = hex::decode("0123456789abcdef0123456789abcdef").expect("secret");
+    let client_hs = generate_test_handshake(&secret, 2, PROTO_TAG_INTERMEDIATE);
+    let client_tag = handshake_proto_tag(&client_hs, &secret).expect("tag");
+    assert_eq!(client_tag, PROTO_TAG_INTERMEDIATE);
   }
 
   #[tokio::test]

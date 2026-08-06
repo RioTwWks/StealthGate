@@ -137,41 +137,60 @@ fn byte_to_secret_mode(value: u8) -> Result<SecretMode> {
   }
 }
 
-/// Дочитывает TLS ClientHello, если первый read вернул неполную запись.
-async fn complete_client_hello_buffer<C: AsyncRead + Unpin>(
+/// Дочитывает TLS ClientHello; при неполной записи шлёт ServerHello, чтобы разблокировать клиента.
+async fn prepare_ee_client_hello<C: AsyncRead + AsyncWrite + Unpin>(
   client: &mut C,
   initial: &[u8],
-) -> Result<Vec<u8>> {
+  secret: &[u8],
+) -> Result<(Vec<u8>, crate::faketls::ParsedClientHello)> {
   let mut buf = initial.to_vec();
-  let Some(needed) = crate::tls::tls_record_total_len(&buf) else {
-    return Ok(buf);
-  };
-  if buf.len() >= needed {
-    return Ok(buf);
-  }
+  let needed = crate::tls::tls_record_total_len(&buf);
+  let mut server_hello_sent = false;
 
-  let deadline = Duration::from_millis(2000);
-  let started = tokio::time::Instant::now();
-  while buf.len() < needed && started.elapsed() < deadline {
-    let mut chunk = [0u8; 1024];
-    let wait = deadline.saturating_sub(started.elapsed());
-    match tokio::time::timeout(wait, client.read(&mut chunk)).await {
-      Ok(Ok(0)) => break,
-      Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
-      Ok(Err(err)) => {
-        return Err(StealthGateError::Proxy(format!("ClientHello read: {err}")));
+  if let Some(needed) = needed {
+    if buf.len() < needed {
+      let partial = crate::faketls::parse_client_hello_prefix(&buf)?;
+      crate::faketls::send_server_hello(client, &partial, secret).await?;
+      server_hello_sent = true;
+      tracing::debug!(
+        peek_len = buf.len(),
+        needed,
+        "split front ee: неполный ClientHello, отправлен ранний ServerHello"
+      );
+
+      let deadline = Duration::from_millis(3000);
+      let started = tokio::time::Instant::now();
+      while buf.len() < needed && started.elapsed() < deadline {
+        let mut chunk = [0u8; 1024];
+        let wait = deadline.saturating_sub(started.elapsed());
+        match tokio::time::timeout(wait, client.read(&mut chunk)).await {
+          Ok(Ok(0)) => break,
+          Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+          Ok(Err(err)) => {
+            return Err(StealthGateError::Proxy(format!("ClientHello read: {err}")));
+          }
+          Err(_) => break,
+        }
       }
-      Err(_) => break,
     }
   }
 
-  if buf.len() < needed {
-    return Err(StealthGateError::Proxy(format!(
-      "неполный ClientHello: {} из {needed} байт",
-      buf.len()
-    )));
+  if let Some(needed) = needed {
+    if buf.len() < needed {
+      return Err(StealthGateError::Proxy(format!(
+        "неполный ClientHello: {} из {needed} байт",
+        buf.len()
+      )));
+    }
   }
-  Ok(buf)
+
+  let client_hello = crate::faketls::parse_client_hello_record(&buf)?;
+  crate::faketls::validate_client_hello(&client_hello, secret)?;
+  if !server_hello_sent {
+    crate::faketls::send_server_hello(client, &client_hello, secret).await?;
+  }
+
+  Ok((buf, client_hello))
 }
 
 /// Front: проксирует MTProto-сессию на back-узел.
@@ -202,10 +221,8 @@ where
 
   let (sgfb_initial, front_relay, preconnected_back) = if secret_mode == SecretMode::Ee {
     let secret = proxy::resolve_secret_bytes(state, secret_label)?;
-    let client_hello_buf = complete_client_hello_buffer(&mut client, initial_data).await?;
-    let client_hello = crate::faketls::parse_client_hello_record(&client_hello_buf)?;
-    crate::faketls::validate_client_hello(&client_hello, &secret)?;
-    crate::faketls::send_server_hello(&mut client, &client_hello, &secret).await?;
+    let (client_hello_buf, client_hello) =
+      prepare_ee_client_hello(&mut client, initial_data, &secret).await?;
 
     let tls_tail = client_hello_buf[client_hello.raw.len()..].to_vec();
     let tls_tail_bytes = tls_tail.len();
@@ -597,15 +614,21 @@ where
   let prefixed = PrefixedStream::new(frame.initial_data, front_stream);
   let mut accepted = mtproto_obfuscate::accept_handshake(prefixed, &secret).await?;
 
-  let (header, relay_keys) = mtproto_obfuscate::generate_relay_init(relay_dc_id)?;
+  let (header, relay_keys) =
+    mtproto_obfuscate::generate_relay_init(relay_dc_id, accepted.proto_tag)?;
   upstream
     .write_all(&header)
     .await
     .map_err(|err| StealthGateError::Proxy(format!("split ee relay header to DC: {err}")))?;
+  upstream
+    .flush()
+    .await
+    .map_err(|err| StealthGateError::Proxy(format!("split ee relay flush to DC: {err}")))?;
 
   tracing::debug!(
     %peer_ip,
     relay_dc_id,
+    proto_tag = %hex::encode(accepted.proto_tag),
     backend = %connected_backend,
     "split back ee: relay init в DC, ACK front для старта obfuscated2 relay"
   );

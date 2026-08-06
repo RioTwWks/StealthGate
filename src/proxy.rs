@@ -175,11 +175,15 @@ where
     mtproto_obfuscate::dc_id_from_backend(preferred_backend)
   };
 
-  let (header, relay_keys) = mtproto_obfuscate::generate_relay_init(dc_id)?;
+  let (header, relay_keys) = mtproto_obfuscate::generate_relay_init(dc_id, accepted.proto_tag)?;
   upstream
     .write_all(&header)
     .await
     .map_err(|err| StealthGateError::Proxy(format!("ee relay header to DC: {err}")))?;
+  upstream
+    .flush()
+    .await
+    .map_err(|err| StealthGateError::Proxy(format!("ee relay flush to DC: {err}")))?;
 
   let dc_stream = ObfuscatedStream::from_relay_keys(upstream, relay_keys);
   copy_bidirectional(accepted.stream, dc_stream).await

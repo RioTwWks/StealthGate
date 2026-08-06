@@ -31,6 +31,64 @@ pub struct ParsedClientHello {
   pub sni: Option<String>,
 }
 
+/// Парсит поля ClientHello из полной или частичной TLS-записи (для раннего ServerHello).
+pub fn parse_client_hello_prefix(data: &[u8]) -> Result<ParsedClientHello> {
+  if data.len() < SERVER_HELLO_RANDOM_OFFSET + 32 {
+    return Err(StealthGateError::Proxy(
+      "недостаточно данных для partial ClientHello".into(),
+    ));
+  }
+  if data[0] != TLS_HANDSHAKE {
+    return Err(StealthGateError::Proxy(
+      "ожидалась TLS handshake-запись".into(),
+    ));
+  }
+
+  let payload = &data[5..];
+  if payload.len() < 4 + 2 + 32 {
+    return Err(StealthGateError::Proxy(
+      "partial ClientHello: нет random".into(),
+    ));
+  }
+
+  let mut cursor = 4usize;
+  cursor += 2;
+  let random: [u8; 32] = payload[cursor..cursor + 32]
+    .try_into()
+    .map_err(|_| StealthGateError::Proxy("partial ClientHello: random".into()))?;
+  cursor += 32;
+  if cursor >= payload.len() {
+    return Err(StealthGateError::Proxy(
+      "partial ClientHello: нет session_id".into(),
+    ));
+  }
+  let session_id_len = payload[cursor] as usize;
+  cursor += 1;
+  if cursor + session_id_len > payload.len() {
+    return Err(StealthGateError::Proxy(
+      "partial ClientHello: обрезан session_id".into(),
+    ));
+  }
+  let session_id = payload[cursor..cursor + session_id_len].to_vec();
+  cursor += session_id_len;
+
+  let cipher_suite = if cursor + 2 <= payload.len() {
+    u16::from_be_bytes([payload[cursor], payload[cursor + 1]])
+  } else {
+    0
+  };
+
+  let sni = crate::tls::try_client_hello_sni(data);
+
+  Ok(ParsedClientHello {
+    raw: data.to_vec(),
+    random,
+    session_id,
+    cipher_suite,
+    sni,
+  })
+}
+
 /// Парсит TLS ClientHello из уже прочитанного буфера.
 pub fn parse_client_hello_record(data: &[u8]) -> Result<ParsedClientHello> {
   let record = parse_record(data).map_err(|err| {
