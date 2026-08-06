@@ -79,6 +79,7 @@ pub struct Detector {
 struct SecretRouteBytes {
   label: String,
   secret: Vec<u8>,
+  secret_hex: String,
   mode: SecretMode,
   backend: String,
   max_connections: u32,
@@ -97,6 +98,7 @@ impl Detector {
       parsed.push(SecretRouteBytes {
         label: route.label.clone(),
         secret: decode_secret(&route.secret)?,
+        secret_hex: route.secret.clone(),
         mode: route.mode,
         backend: route.backend.clone(),
         max_connections: route.max_connections,
@@ -153,6 +155,22 @@ impl Detector {
     }
 
     if looks_like_tls_client_hello(data) {
+      if let Ok(ch) = crate::faketls::parse_client_hello_record(data) {
+        for route in &self.routes {
+          if route.mode == SecretMode::Ee
+            && crate::faketls::validate_client_hello(&ch, &route.secret).is_ok()
+          {
+            return DetectionResult::mtproto(
+              ch.sni.or(sni.clone()),
+              route.label.clone(),
+              route.mode,
+              route.backend.clone(),
+              route.max_connections,
+            );
+          }
+        }
+      }
+
       if let Some(ref domain) = sni {
         if self.matches_fake_domain(domain) {
           let route = self.routes.first();
@@ -165,9 +183,38 @@ impl Detector {
           );
         }
       }
+
+      if let Some(route) = self.match_probable_ee_client_hello(data) {
+        return DetectionResult::mtproto(
+          sni.clone(),
+          route.label.clone(),
+          route.mode,
+          route.backend.clone(),
+          route.max_connections,
+        );
+      }
     }
 
     DetectionResult::fallback(sni)
+  }
+
+  /// Неполный, но типичный ee ClientHello (крупная TLS-запись) + ee-маршрут с доменом.
+  fn match_probable_ee_client_hello(&self, data: &[u8]) -> Option<&SecretRouteBytes> {
+    let needed = crate::tls::tls_record_total_len(data)?;
+    if data.len() >= needed || needed < 1200 {
+      return None;
+    }
+    let route = self.routes.iter().find(|route| route.mode == SecretMode::Ee)?;
+    if let Some(domain) = crate::config::secret_embedded_domain(&route.secret_hex) {
+      if self.matches_fake_domain(&domain) {
+        return Some(route);
+      }
+      return None;
+    }
+    if !self.fake_domains.is_empty() {
+      return Some(route);
+    }
+    None
   }
 
   fn matches_fake_domain(&self, domain: &str) -> bool {
@@ -367,5 +414,34 @@ mod tests {
     let payload = build_client_hello("example.com");
     let result = detector.detect(&payload);
     assert_eq!(result.traffic_type, TrafficType::Fallback);
+  }
+
+  #[test]
+  fn detects_partial_ee_client_hello_without_full_sni_parse() {
+    use crate::tls::test_support::build_client_hello;
+
+    let routes = vec![SecretRoute {
+      label: "default".into(),
+      secret: "ee0123456789abcdef0123456789abcdef".into(),
+      mode: SecretMode::Ee,
+      backend: "149.154.167.99:443".into(),
+      max_connections: 0,
+    }];
+    let detector =
+      Detector::from_routes(&routes, &["www.cloudflare.com".into()]).expect("detector");
+
+    let mut full = build_client_hello("www.cloudflare.com");
+    // Имитируем крупный ee ClientHello (как в проде: needed=1728, peek=1334).
+    let declared_len = 1728usize;
+    full[3] = ((declared_len - 5) >> 8) as u8;
+    full[4] = ((declared_len - 5) & 0xff) as u8;
+    let partial_len = 1334.min(full.len());
+    let partial = &full[..partial_len];
+    let result = detector.detect(partial);
+    assert_eq!(
+      result.traffic_type,
+      TrafficType::Mtproto,
+      "partial ee-sized ClientHello should be detected"
+    );
   }
 }

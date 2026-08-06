@@ -280,16 +280,80 @@ pub fn try_client_hello_sni(data: &[u8]) -> Option<String> {
     return None;
   }
   if let Ok(record) = parse_record(data) {
-    return parse_client_hello(record.payload)
-      .ok()
-      .and_then(|hello| hello.sni);
+    if let Ok(hello) = parse_client_hello(record.payload) {
+      return hello.sni;
+    }
+    return try_client_hello_sni_from_payload(record.payload);
   }
   if data.len() > 5 {
-    return parse_client_hello(&data[5..])
-      .ok()
-      .and_then(|hello| hello.sni);
+    if let Ok(hello) = parse_client_hello(&data[5..]) {
+      return hello.sni;
+    }
+    return try_client_hello_sni_from_payload(&data[5..]);
   }
   None
+}
+
+/// Извлекает SNI из частичного handshake payload (без проверки полной длины ClientHello).
+pub fn try_client_hello_sni_from_payload(payload: &[u8]) -> Option<String> {
+  if payload.is_empty() || HandshakeType::from_byte(payload[0]) != HandshakeType::ClientHello {
+    return None;
+  }
+  if payload.len() < 4 {
+    return None;
+  }
+
+  let mut cursor = 4usize;
+  if cursor + 2 > payload.len() {
+    return None;
+  }
+  cursor += 2; // client_version
+
+  if cursor + 32 > payload.len() {
+    return None;
+  }
+  cursor += 32; // random
+
+  if cursor >= payload.len() {
+    return None;
+  }
+  let session_id_len = payload[cursor] as usize;
+  cursor += 1;
+  if cursor + session_id_len > payload.len() {
+    return None;
+  }
+  cursor += session_id_len;
+
+  if cursor + 2 > payload.len() {
+    return None;
+  }
+  let cipher_suites_len = u16::from_be_bytes([payload[cursor], payload[cursor + 1]]) as usize;
+  cursor += 2;
+  if cursor + cipher_suites_len > payload.len() {
+    return None;
+  }
+  cursor += cipher_suites_len;
+
+  if cursor >= payload.len() {
+    return None;
+  }
+  let compression_len = payload[cursor] as usize;
+  cursor += 1;
+  if cursor + compression_len > payload.len() {
+    return None;
+  }
+  cursor += compression_len;
+
+  if cursor + 2 > payload.len() {
+    return None;
+  }
+  let extensions_len = u16::from_be_bytes([payload[cursor], payload[cursor + 1]]) as usize;
+  cursor += 2;
+  let extensions_end = cursor.saturating_add(extensions_len).min(payload.len());
+  if cursor >= extensions_end {
+    return None;
+  }
+  extract_sni(&payload[cursor..extensions_end])
 }
 
 /// Проверяет, похожи ли байты на TLS ClientHello.
@@ -458,6 +522,14 @@ mod tests {
   fn tls_record_total_len_matches_parse() {
     let data = build_client_hello("example.com");
     assert_eq!(tls_record_total_len(&data), Some(data.len()));
+  }
+
+  #[test]
+  fn partial_client_hello_sni_from_payload() {
+    let data = build_client_hello("www.cloudflare.com");
+    let payload = &data[5..];
+    let sni = try_client_hello_sni_from_payload(payload).expect("sni from full payload");
+    assert_eq!(sni, "www.cloudflare.com");
   }
 
   #[test]

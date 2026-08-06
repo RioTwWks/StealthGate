@@ -29,6 +29,7 @@ use crate::tls_server;
 
 const PEEK_BUFFER_SIZE: usize = 4096;
 const PEEK_READ_TIMEOUT: Duration = Duration::from_secs(3);
+const CLIENT_HELLO_COMPLETE_WAIT: Duration = Duration::from_millis(1500);
 
 /// Читает начальный буфер, дочитывая неполные TLS-записи (крупный ee ClientHello).
 async fn read_initial_peek(client: &mut TcpStream) -> Result<Vec<u8>> {
@@ -48,29 +49,49 @@ async fn read_initial_peek(client: &mut TcpStream) -> Result<Vec<u8>> {
         "TLS-запись слишком большая для peek: {needed} > {PEEK_BUFFER_SIZE}"
       )));
     }
-    // ClientHello: не блокируем — клиент может ждать ServerHello перед остатком записи.
+    // ClientHello: дочитываем запись (TCP может фрагментировать крупный ee ClientHello).
     if looks_like_tls_client_hello(&buf[..total]) && total < needed {
-      tracing::trace!(
-        peek_len = total,
-        needed,
-        "peek: неполный ClientHello, продолжаем без дочитывания"
-      );
-      buf.truncate(total);
-      return Ok(buf);
-    }
-    while total < needed {
-      let to_read = (needed - total).min(PEEK_BUFFER_SIZE - total);
-      match tokio::time::timeout(PEEK_READ_TIMEOUT, client.read(&mut buf[total..total + to_read]))
+      let started = tokio::time::Instant::now();
+      while total < needed && started.elapsed() < CLIENT_HELLO_COMPLETE_WAIT {
+        let to_read = (needed - total).min(PEEK_BUFFER_SIZE - total);
+        match tokio::time::timeout(
+          CLIENT_HELLO_COMPLETE_WAIT.saturating_sub(started.elapsed()),
+          client.read(&mut buf[total..total + to_read]),
+        )
         .await
-      {
-        Ok(Ok(0)) => break,
-        Ok(Ok(n)) => total += n,
-        Ok(Err(err)) => {
-          return Err(StealthGateError::Proxy(format!(
-            "дочитывание TLS-записи: {err}"
-          )));
+        {
+          Ok(Ok(0)) => break,
+          Ok(Ok(n)) => total += n,
+          Ok(Err(err)) => {
+            return Err(StealthGateError::Proxy(format!(
+              "дочитывание TLS-записи: {err}"
+            )));
+          }
+          Err(_) => break,
         }
-        Err(_) => break,
+      }
+      if total < needed {
+        tracing::trace!(
+          peek_len = total,
+          needed,
+          "peek: неполный ClientHello после короткого ожидания"
+        );
+      }
+    } else if total < needed {
+      while total < needed {
+        let to_read = (needed - total).min(PEEK_BUFFER_SIZE - total);
+        match tokio::time::timeout(PEEK_READ_TIMEOUT, client.read(&mut buf[total..total + to_read]))
+          .await
+        {
+          Ok(Ok(0)) => break,
+          Ok(Ok(n)) => total += n,
+          Ok(Err(err)) => {
+            return Err(StealthGateError::Proxy(format!(
+              "дочитывание TLS-записи: {err}"
+            )));
+          }
+          Err(_) => break,
+        }
       }
     }
     if total < needed {

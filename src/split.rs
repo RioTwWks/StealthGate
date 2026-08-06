@@ -147,10 +147,10 @@ async fn complete_client_hello_buffer<C: AsyncRead + Unpin>(
     return Ok(buf);
   };
   if buf.len() >= needed {
-    return Ok(buf[..needed].to_vec());
+    return Ok(buf);
   }
 
-  let deadline = Duration::from_millis(800);
+  let deadline = Duration::from_millis(2000);
   let started = tokio::time::Instant::now();
   while buf.len() < needed && started.elapsed() < deadline {
     let mut chunk = [0u8; 1024];
@@ -171,7 +171,7 @@ async fn complete_client_hello_buffer<C: AsyncRead + Unpin>(
       buf.len()
     )));
   }
-  Ok(buf[..needed].to_vec())
+  Ok(buf)
 }
 
 /// Front: проксирует MTProto-сессию на back-узел.
