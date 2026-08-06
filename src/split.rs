@@ -16,7 +16,6 @@ use crate::error::{Result, StealthGateError};
 use crate::faketls::FakeTlsStream;
 use crate::io_util::PrefixedStream;
 use crate::mtproto_obfuscate::{self, ObfuscatedStream};
-use crate::drs;
 use crate::proxy;
 use crate::sgfb_crypto::{self, EncryptedStream, SessionKeys};
 use crate::state::AppState;
@@ -274,22 +273,6 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for EitherRelayStream<S> {
   }
 }
 
-async fn relay_streams<S1, S2>(
-  client_io: S1,
-  back_io: S2,
-  drs: &crate::config::DrsConfig,
-) -> Result<(u64, u64)>
-where
-  S1: AsyncRead + AsyncWrite + Unpin,
-  S2: AsyncRead + AsyncWrite + Unpin,
-{
-  if drs.ee_relay {
-    drs::copy_bidirectional_shaped(client_io, back_io, drs).await
-  } else {
-    proxy::copy_bidirectional(client_io, back_io).await
-  }
-}
-
 /// Front: проксирует MTProto-сессию на back-узел.
 pub async fn relay_from_front<C>(
   mut client: C,
@@ -498,11 +481,11 @@ where
                   "split front ee: ACK получен, старт obfuscated2 relay"
                 );
                 let client_io = PrefixedStream::new(obf2_prefix, tls_io);
-                relay_streams(client_io, back_io, &drs).await?
+                proxy::copy_bidirectional_graceful(client_io, back_io).await?
               }
               FrontRelay::Plain { initial, client } => {
                 let client_io = PrefixedStream::new(initial, client);
-                relay_streams(client_io, back_io, &drs).await?
+                proxy::copy_bidirectional_graceful(client_io, back_io).await?
               }
             };
             state
@@ -516,6 +499,13 @@ where
               b2c,
               "split front-сессия завершена"
             );
+            if b2c == 0 && c2b > 0 {
+              tracing::warn!(
+                back = %back_addr,
+                c2b,
+                "split front: данные ушли на back, но ответ не вернулся (b2c=0)"
+              );
+            }
             return Ok(());
           }
           Err(err) => {
@@ -735,7 +725,13 @@ where
     );
   }
 
-  // relay init → plaintext ACK → encrypted relay (SGFB v2).
+  // Как monolith relay_ee_streams: ACK → encrypt → accept_handshake → relay init → copy.
+  send_ack(&mut front_stream, true, None).await?;
+
+  let front_io = wrap_relay_stream(front_stream, session_keys, relay_encrypted, false);
+  let prefixed = PrefixedStream::new(frame.initial_data, front_io);
+  let accepted = mtproto_obfuscate::accept_handshake(prefixed, &secret).await?;
+
   let (header, relay_keys) = mtproto_obfuscate::generate_relay_init(relay_dc_id, proto_tag)?;
   upstream
     .write_all(&header)
@@ -752,18 +748,13 @@ where
     proto_tag = %hex::encode(proto_tag),
     backend = %connected_backend,
     encrypted = relay_encrypted,
-    "split back ee: relay init в DC, plaintext ACK front"
+    "split back ee: accept_handshake + relay init, старт copy"
   );
 
-  send_ack(&mut front_stream, true, None).await?;
   state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
 
-  let front_io = wrap_relay_stream(front_stream, session_keys, relay_encrypted, false);
-  let prefixed = PrefixedStream::new(frame.initial_data, front_io);
-  let accepted = mtproto_obfuscate::accept_handshake(prefixed, &secret).await?;
-
   let dc_stream = ObfuscatedStream::from_relay_keys(upstream, relay_keys);
-  let (c2b, b2c) = proxy::copy_bidirectional(accepted.stream, dc_stream).await?;
+  let (c2b, b2c) = proxy::copy_bidirectional_graceful(accepted.stream, dc_stream).await?;
   state
     .stats
     .bytes_to_backend

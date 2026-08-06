@@ -167,7 +167,7 @@ pub async fn relay_ee_streams<C, U>(
   mut upstream: U,
   secret: &[u8],
   preferred_backend: &str,
-  drs: &DrsConfig,
+  _drs: &DrsConfig,
 ) -> Result<(u64, u64)>
 where
   C: AsyncRead + AsyncWrite + Unpin,
@@ -191,11 +191,7 @@ where
     .map_err(|err| StealthGateError::Proxy(format!("ee relay flush to DC: {err}")))?;
 
   let dc_stream = ObfuscatedStream::from_relay_keys(upstream, relay_keys);
-  if drs.ee_relay {
-    drs::copy_bidirectional_shaped(accepted.stream, dc_stream, drs).await
-  } else {
-    copy_bidirectional(accepted.stream, dc_stream).await
-  }
+  copy_bidirectional_graceful(accepted.stream, dc_stream).await
 }
 
 /// Мост ee Fake TLS → уже инициализированный obfuscated2-поток к DC (relay init уже отправлен).
@@ -252,14 +248,44 @@ where
   L: AsyncRead + AsyncWrite + Unpin,
   R: AsyncRead + AsyncWrite + Unpin,
 {
+  copy_bidirectional_graceful(left, right).await
+}
+
+fn is_benign_copy_error(err: &std::io::Error) -> bool {
+  matches!(
+    err.kind(),
+    std::io::ErrorKind::BrokenPipe
+      | std::io::ErrorKind::ConnectionReset
+      | std::io::ErrorKind::UnexpectedEof
+  )
+}
+
+/// Как copy_bidirectional, но не падает, если одна сторона закрыла соединение.
+pub async fn copy_bidirectional_graceful<L, R>(left: L, right: R) -> Result<(u64, u64)>
+where
+  L: AsyncRead + AsyncWrite + Unpin,
+  R: AsyncRead + AsyncWrite + Unpin,
+{
   let (mut left_read, mut left_write) = tokio::io::split(left);
   let (mut right_read, mut right_write) = tokio::io::split(right);
 
-  let client_to_server = tokio::io::copy(&mut left_read, &mut right_write);
-  let server_to_client = tokio::io::copy(&mut right_read, &mut left_write);
+  let client_to_server = async {
+    match tokio::io::copy(&mut left_read, &mut right_write).await {
+      Ok(n) => Ok(n),
+      Err(err) if is_benign_copy_error(&err) => Ok(0),
+      Err(err) => Err(err),
+    }
+  };
+  let server_to_client = async {
+    match tokio::io::copy(&mut right_read, &mut left_write).await {
+      Ok(n) => Ok(n),
+      Err(err) if is_benign_copy_error(&err) => Ok(0),
+      Err(err) => Err(err),
+    }
+  };
 
   let (c2s, s2c) = tokio::try_join!(client_to_server, server_to_client).map_err(|err| {
-    crate::error::StealthGateError::Proxy(format!("ошибка copy_bidirectional: {err}"))
+    StealthGateError::Proxy(format!("ошибка copy_bidirectional: {err}"))
   })?;
 
   Ok((c2s, s2c))
