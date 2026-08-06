@@ -145,6 +145,10 @@ where
     .write_all(&packet)
     .await
     .map_err(|err| StealthGateError::Proxy(format!("send ServerHello: {err}")))?;
+  stream
+    .flush()
+    .await
+    .map_err(|err| StealthGateError::Proxy(format!("flush ServerHello: {err}")))?;
   Ok(())
 }
 
