@@ -311,58 +311,53 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ObfuscatedStream<S> {
     cx: &mut Context<'_>,
     buf: &[u8],
   ) -> Poll<std::io::Result<usize>> {
-    loop {
-      if !self.pending_write.is_empty() {
-        let pending = std::mem::take(&mut self.pending_write);
-        match Pin::new(&mut self.inner).poll_write(cx, &pending) {
-          Poll::Ready(Ok(0)) => {
-            self.pending_write = pending;
-            return Poll::Ready(Err(std::io::Error::new(
-              std::io::ErrorKind::WriteZero,
-              "write zero",
-            )));
-          }
-          Poll::Ready(Ok(n)) => {
-            if n < pending.len() {
-              self.pending_write = pending[n..].to_vec();
-              return Poll::Pending;
-            }
-          }
-          Poll::Ready(Err(err)) => {
-            self.pending_write = pending;
-            return Poll::Ready(Err(err));
-          }
-          Poll::Pending => {
-            self.pending_write = pending;
-            return Poll::Pending;
-          }
-        }
-      }
-
-      if buf.is_empty() {
-        return Poll::Ready(Ok(0));
-      }
-
-      let mut out = buf.to_vec();
-      self.enc.apply_keystream(&mut out);
-
-      match Pin::new(&mut self.inner).poll_write(cx, &out) {
+    if !self.pending_write.is_empty() {
+      let pending = std::mem::take(&mut self.pending_write);
+      match Pin::new(&mut self.inner).poll_write(cx, &pending) {
         Poll::Ready(Ok(0)) => {
+          self.pending_write = pending;
           return Poll::Ready(Err(std::io::Error::new(
             std::io::ErrorKind::WriteZero,
             "write zero",
           )));
         }
-        Poll::Ready(Ok(n)) if n < out.len() => {
-          self.pending_write = out[n..].to_vec();
-          return Poll::Ready(Ok(buf.len()));
-        }
-        Poll::Ready(Ok(_)) => return Poll::Ready(Ok(buf.len())),
-        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-        Poll::Pending => {
-          self.pending_write = out;
+        Poll::Ready(Ok(n)) if n < pending.len() => {
+          self.pending_write = pending[n..].to_vec();
           return Poll::Pending;
         }
+        Poll::Ready(Ok(_)) => {}
+        Poll::Ready(Err(err)) => {
+          self.pending_write = pending;
+          return Poll::Ready(Err(err));
+        }
+        Poll::Pending => {
+          self.pending_write = pending;
+          return Poll::Pending;
+        }
+      }
+    }
+
+    if buf.is_empty() {
+      return Poll::Ready(Ok(0));
+    }
+
+    let mut out = buf.to_vec();
+    self.enc.apply_keystream(&mut out);
+
+    match Pin::new(&mut self.inner).poll_write(cx, &out) {
+      Poll::Ready(Ok(0)) => Poll::Ready(Err(std::io::Error::new(
+        std::io::ErrorKind::WriteZero,
+        "write zero",
+      ))),
+      Poll::Ready(Ok(n)) if n < out.len() => {
+        self.pending_write = out[n..].to_vec();
+        Poll::Ready(Ok(buf.len()))
+      }
+      Poll::Ready(Ok(_)) => Poll::Ready(Ok(buf.len())),
+      Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+      Poll::Pending => {
+        self.pending_write = out;
+        Poll::Pending
       }
     }
   }
