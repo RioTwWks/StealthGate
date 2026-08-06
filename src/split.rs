@@ -137,6 +137,43 @@ fn byte_to_secret_mode(value: u8) -> Result<SecretMode> {
   }
 }
 
+/// Дочитывает TLS ClientHello, если первый read вернул неполную запись.
+async fn complete_client_hello_buffer<C: AsyncRead + Unpin>(
+  client: &mut C,
+  initial: &[u8],
+) -> Result<Vec<u8>> {
+  let mut buf = initial.to_vec();
+  let Some(needed) = crate::tls::tls_record_total_len(&buf) else {
+    return Ok(buf);
+  };
+  if buf.len() >= needed {
+    return Ok(buf[..needed].to_vec());
+  }
+
+  let deadline = Duration::from_millis(800);
+  let started = tokio::time::Instant::now();
+  while buf.len() < needed && started.elapsed() < deadline {
+    let mut chunk = [0u8; 1024];
+    let wait = deadline.saturating_sub(started.elapsed());
+    match tokio::time::timeout(wait, client.read(&mut chunk)).await {
+      Ok(Ok(0)) => break,
+      Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+      Ok(Err(err)) => {
+        return Err(StealthGateError::Proxy(format!("ClientHello read: {err}")));
+      }
+      Err(_) => break,
+    }
+  }
+
+  if buf.len() < needed {
+    return Err(StealthGateError::Proxy(format!(
+      "неполный ClientHello: {} из {needed} байт",
+      buf.len()
+    )));
+  }
+  Ok(buf[..needed].to_vec())
+}
+
 /// Front: проксирует MTProto-сессию на back-узел.
 pub async fn relay_from_front<C>(
   mut client: C,
@@ -158,23 +195,25 @@ where
       client: C,
     },
     EePlain {
+      obf2_prefix: Vec<u8>,
       tls_io: FakeTlsStream<PrefixedStream<C>>,
     },
   }
 
   let (sgfb_initial, front_relay, preconnected_back) = if secret_mode == SecretMode::Ee {
     let secret = proxy::resolve_secret_bytes(state, secret_label)?;
-    let client_hello = crate::faketls::parse_client_hello_record(initial_data)?;
+    let client_hello_buf = complete_client_hello_buffer(&mut client, initial_data).await?;
+    let client_hello = crate::faketls::parse_client_hello_record(&client_hello_buf)?;
     crate::faketls::validate_client_hello(&client_hello, &secret)?;
     crate::faketls::send_server_hello(&mut client, &client_hello, &secret).await?;
 
-    let tls_tail = initial_data[client_hello.raw.len()..].to_vec();
+    let tls_tail = client_hello_buf[client_hello.raw.len()..].to_vec();
     let tls_tail_bytes = tls_tail.len();
     let timeout = Duration::from_secs(split.connect_timeout_secs);
     let first_back = split.back_servers.first().cloned();
     let mut tls_io = FakeTlsStream::new(PrefixedStream::new(tls_tail, client));
 
-    let (handshake, tls_io, preconnect) = if let Some(back_addr) = first_back {
+    let (handshake, obf2_prefix, tls_io, preconnect) = if let Some(back_addr) = first_back {
       let (io_result, preconnect) = tokio::join!(
         async {
           let mut handshake = [0u8; mtproto_obfuscate::HANDSHAKE_LEN];
@@ -189,7 +228,8 @@ where
           mtproto_obfuscate::parse_handshake(&handshake, &secret).ok_or_else(|| {
             StealthGateError::Proxy("split front: невалидный obfuscated2 handshake".into())
           })?;
-          Ok::<_, StealthGateError>((handshake, tls_io))
+          let obf2_prefix = tls_io.take_read_buf();
+          Ok::<_, StealthGateError>((handshake, obf2_prefix, tls_io))
         },
         async {
           match tokio::time::timeout(timeout, TcpStream::connect(&back_addr)).await {
@@ -198,10 +238,10 @@ where
           }
         }
       );
-      let (handshake, tls_io) = io_result?;
-      (handshake, tls_io, preconnect)
+      let (handshake, obf2_prefix, tls_io) = io_result?;
+      (handshake, obf2_prefix, tls_io, preconnect)
     } else {
-      let (handshake, tls_io) = async {
+      let (handshake, obf2_prefix, tls_io) = async {
         let mut handshake = [0u8; mtproto_obfuscate::HANDSHAKE_LEN];
         tls_io
           .read_exact(&mut handshake)
@@ -210,23 +250,25 @@ where
         mtproto_obfuscate::parse_handshake(&handshake, &secret).ok_or_else(|| {
           StealthGateError::Proxy("split front: невалидный obfuscated2 handshake".into())
         })?;
-        Ok::<_, StealthGateError>((handshake, tls_io))
+        let obf2_prefix = tls_io.take_read_buf();
+        Ok::<_, StealthGateError>((handshake, obf2_prefix, tls_io))
       }
       .await?;
-      (handshake, tls_io, None)
+      (handshake, obf2_prefix, tls_io, None)
     };
 
     tracing::debug!(
       sni = ?client_hello.sni,
       tls_tail_bytes,
       handshake_bytes = handshake.len(),
+      obf2_prefix_bytes = obf2_prefix.len(),
       preconnected = preconnect.is_some(),
       "split front: прочитан obfuscated2 handshake, передаём в SGFB initial_data"
     );
 
     (
       handshake.to_vec(),
-      FrontRelay::EePlain { tls_io },
+      FrontRelay::EePlain { obf2_prefix, tls_io },
       preconnect,
     )
   } else {
@@ -310,9 +352,16 @@ where
           Ok(()) => {
             state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
             let (c2b, b2c) = match front_relay {
-              FrontRelay::EePlain { tls_io } => {
-                tracing::debug!("split front ee: ACK получен, старт plaintext obfuscated2 relay");
-                proxy::copy_bidirectional(tls_io, back_stream).await?
+              FrontRelay::EePlain {
+                obf2_prefix,
+                tls_io,
+              } => {
+                tracing::debug!(
+                  obf2_prefix_bytes = obf2_prefix.len(),
+                  "split front ee: ACK получен, старт plaintext obfuscated2 relay"
+                );
+                let client_io = PrefixedStream::new(obf2_prefix, tls_io);
+                proxy::copy_bidirectional(client_io, back_stream).await?
               }
               FrontRelay::Plain { initial, client } => {
                 let client_io = PrefixedStream::new(initial, client);
@@ -544,6 +593,10 @@ where
     );
   }
 
+  // Как в monolith relay_ee_streams: accept_handshake → relay init → ACK → copy.
+  let prefixed = PrefixedStream::new(frame.initial_data, front_stream);
+  let mut accepted = mtproto_obfuscate::accept_handshake(prefixed, &secret).await?;
+
   let (header, relay_keys) = mtproto_obfuscate::generate_relay_init(relay_dc_id)?;
   upstream
     .write_all(&header)
@@ -557,11 +610,9 @@ where
     "split back ee: relay init в DC, ACK front для старта obfuscated2 relay"
   );
 
-  send_ack(&mut front_stream, true, None).await?;
+  send_ack(accepted.stream.inner_mut(), true, None).await?;
   state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
 
-  let prefixed = PrefixedStream::new(frame.initial_data, front_stream);
-  let accepted = mtproto_obfuscate::accept_handshake(prefixed, &secret).await?;
   let dc_stream = ObfuscatedStream::from_relay_keys(upstream, relay_keys);
   let (c2b, b2c) = proxy::copy_bidirectional(accepted.stream, dc_stream).await?;
   state

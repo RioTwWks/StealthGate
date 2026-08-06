@@ -1,7 +1,7 @@
 use crate::config::{decode_secret, SecretMode, SecretRoute};
 use crate::error::Result;
 use crate::mtproto_obfuscate;
-use crate::tls::{looks_like_tls_client_hello, parse_client_hello, parse_record};
+use crate::tls::looks_like_tls_client_hello;
 
 /// Подсказка о формате нераспознанного трафика (для диагностики).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,12 +235,7 @@ pub fn fallback_diagnostic_message(hint: TrafficHint, has_ee_route: bool) -> Opt
 }
 
 fn extract_sni(data: &[u8]) -> Option<String> {
-  if !looks_like_tls_client_hello(data) {
-    return None;
-  }
-  let record = parse_record(data).ok()?;
-  let hello = parse_client_hello(record.payload).ok()?;
-  hello.sni
+  crate::tls::try_client_hello_sni(data)
 }
 
 #[cfg(test)]

@@ -225,6 +225,11 @@ impl<S> FakeTlsStream<S> {
       read_buf: Vec::new(),
     }
   }
+
+  /// Забирает байты, оставшиеся после разбора TLS Application Data (например, хвост кадра с handshake).
+  pub fn take_read_buf(&mut self) -> Vec<u8> {
+    std::mem::take(&mut self.read_buf)
+  }
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for FakeTlsStream<S> {

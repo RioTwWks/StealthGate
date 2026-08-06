@@ -281,6 +281,11 @@ impl<S> ObfuscatedStream<S> {
   pub fn into_inner(self) -> S {
     self.inner
   }
+
+  /// Доступ к внутреннему потоку (например, для SGFB ACK до relay).
+  pub fn inner_mut(&mut self) -> &mut S {
+    &mut self.inner
+  }
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for ObfuscatedStream<S> {

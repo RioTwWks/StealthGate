@@ -274,6 +274,24 @@ pub fn tls_record_total_len(data: &[u8]) -> Option<usize> {
   5usize.checked_add(payload_len)
 }
 
+/// Пытается извлечь SNI из полной или частичной TLS ClientHello-записи.
+pub fn try_client_hello_sni(data: &[u8]) -> Option<String> {
+  if !looks_like_tls_client_hello(data) {
+    return None;
+  }
+  if let Ok(record) = parse_record(data) {
+    return parse_client_hello(record.payload)
+      .ok()
+      .and_then(|hello| hello.sni);
+  }
+  if data.len() > 5 {
+    return parse_client_hello(&data[5..])
+      .ok()
+      .and_then(|hello| hello.sni);
+  }
+  None
+}
+
 /// Проверяет, похожи ли байты на TLS ClientHello.
 pub fn looks_like_tls_client_hello(data: &[u8]) -> bool {
   if data.len() < 6 {

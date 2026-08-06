@@ -48,6 +48,16 @@ async fn read_initial_peek(client: &mut TcpStream) -> Result<Vec<u8>> {
         "TLS-запись слишком большая для peek: {needed} > {PEEK_BUFFER_SIZE}"
       )));
     }
+    // ClientHello: не блокируем — клиент может ждать ServerHello перед остатком записи.
+    if looks_like_tls_client_hello(&buf[..total]) && total < needed {
+      tracing::trace!(
+        peek_len = total,
+        needed,
+        "peek: неполный ClientHello, продолжаем без дочитывания"
+      );
+      buf.truncate(total);
+      return Ok(buf);
+    }
     while total < needed {
       let to_read = (needed - total).min(PEEK_BUFFER_SIZE - total);
       match tokio::time::timeout(PEEK_READ_TIMEOUT, client.read(&mut buf[total..total + to_read]))
@@ -387,12 +397,7 @@ fn ja4_allowed(data: &[u8], profiles: &[String]) -> bool {
 }
 
 fn extract_sni(data: &[u8]) -> Option<String> {
-  if !looks_like_tls_client_hello(data) {
-    return None;
-  }
-  let record = parse_record(data).ok()?;
-  let hello = parse_client_hello(record.payload).ok()?;
-  hello.sni
+  crate::tls::try_client_hello_sni(data)
 }
 
 fn log_ja4(data: &[u8], profiles: &[String]) {
