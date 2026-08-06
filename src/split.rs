@@ -158,18 +158,23 @@ async fn prepare_ee_client_hello<C: AsyncRead + AsyncWrite + Unpin>(
         "split front ee: неполный ClientHello, отправлен ранний ServerHello"
       );
 
-      let deadline = Duration::from_millis(3000);
-      let started = tokio::time::Instant::now();
-      while buf.len() < needed && started.elapsed() < deadline {
-        let mut chunk = [0u8; 1024];
-        let wait = deadline.saturating_sub(started.elapsed());
-        match tokio::time::timeout(wait, client.read(&mut chunk)).await {
-          Ok(Ok(0)) => break,
-          Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
-          Ok(Err(err)) => {
-            return Err(StealthGateError::Proxy(format!("ClientHello read: {err}")));
-          }
-          Err(_) => break,
+      let remaining = needed - buf.len();
+      let mut tail = vec![0u8; remaining];
+      let deadline = Duration::from_secs(10);
+      match tokio::time::timeout(deadline, client.read_exact(&mut tail)).await {
+        Ok(Ok(_)) => buf.extend_from_slice(&tail),
+        Ok(Err(err)) => {
+          return Err(StealthGateError::Proxy(format!(
+            "ClientHello tail after ServerHello: {err}"
+          )));
+        }
+        Err(_) => {
+          tracing::debug!(
+            peek_len = buf.len(),
+            needed,
+            remaining,
+            "split front ee: таймаут дочитывания ClientHello после ServerHello"
+          );
         }
       }
     }
