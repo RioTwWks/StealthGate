@@ -210,7 +210,19 @@ pub fn validate_client_hello(ch: &ParsedClientHello, secret: &[u8]) -> Result<()
 /// Собирает ClientHello с валидным ee HMAC (для тестов и E2E).
 pub fn build_signed_client_hello(sni: &str, secret: &[u8]) -> Vec<u8> {
   let mut data = crate::tls::test_support::build_client_hello(sni);
-  let mut modified = data.clone();
+  sign_client_hello_record(&mut data, secret);
+  data
+}
+
+/// Крупный ee ClientHello (как у Telegram: ~1700+ байт) с валидным HMAC.
+pub fn build_signed_client_hello_min_len(sni: &str, secret: &[u8], min_len: usize) -> Vec<u8> {
+  let mut data = crate::tls::test_support::build_client_hello_padded(sni, min_len);
+  sign_client_hello_record(&mut data, secret);
+  data
+}
+
+fn sign_client_hello_record(data: &mut [u8], secret: &[u8]) {
+  let mut modified = data.to_vec();
   modified[SERVER_HELLO_RANDOM_OFFSET..SERVER_HELLO_RANDOM_OFFSET + 32].fill(0);
 
   let mut mac = HmacSha256::new_from_slice(secret).expect("hmac key");
@@ -229,8 +241,6 @@ pub fn build_signed_client_hello(sni: &str, secret: &[u8]) -> Vec<u8> {
   for i in 0..4 {
     data[SERVER_HELLO_RANDOM_OFFSET + 28 + i] = digest[28 + i] ^ ts_bytes[i];
   }
-
-  data
 }
 
 /// Отправляет синтетический TLS ServerHello + ChangeCipherSpec + padding.

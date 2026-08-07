@@ -323,15 +323,26 @@ where
 
   let (sgfb_initial, front_relay, preconnected_back) = if secret_mode == SecretMode::Ee {
     let secret = proxy::resolve_secret_bytes(state, secret_label)?;
+    let timeout = Duration::from_secs(split.connect_timeout_secs);
+    let first_back = split.back_servers.first().cloned();
+    // Connect к back параллельно с ClientHello/ServerHello (не ждём handshake).
+    let back_connect = first_back.as_ref().map(|back_addr| {
+      let back_addr = back_addr.clone();
+      tokio::spawn(async move {
+        tokio::time::timeout(timeout, TcpStream::connect(&back_addr)).await
+      })
+    });
+
     let (client_hello_buf, client_hello) =
       prepare_ee_client_hello(&mut client, initial_data, &secret).await?;
 
-    let tls_tail = client_hello_buf[client_hello.raw.len()..].to_vec();
-    let tls_tail_bytes = tls_tail.len();
-    let timeout = Duration::from_secs(split.connect_timeout_secs);
-    let first_back = split.back_servers.first().cloned();
+    // Весь peek-буфер (в т.ч. partial ClientHello 1334/1728): после ServerHello клиент
+    // досылает хвост той же TLS-записи без нового заголовка — без префикса FakeTlsStream
+    // сбивает разбор кадров и obfuscated2 handshake не читается.
+    let tls_prefix = client_hello_buf.clone();
+    let tls_prefix_bytes = tls_prefix.len();
     let mut tls_io = FakeTlsStream::with_write_options(
-      PrefixedStream::new(tls_tail, client),
+      PrefixedStream::new(tls_prefix, client),
       write_opts.clone(),
     );
 
@@ -354,8 +365,11 @@ where
           Ok::<_, StealthGateError>((handshake, obf2_prefix, tls_io))
         },
         async {
-          match tokio::time::timeout(timeout, TcpStream::connect(&back_addr)).await {
-            Ok(Ok(stream)) => Some((back_addr, stream)),
+          let Some(handle) = back_connect else {
+            return None;
+          };
+          match handle.await {
+            Ok(Ok(Ok(stream))) => Some((back_addr, stream)),
             _ => None,
           }
         }
@@ -381,7 +395,7 @@ where
 
     tracing::debug!(
       sni = ?client_hello.sni,
-      tls_tail_bytes,
+      tls_prefix_bytes,
       handshake_bytes = handshake.len(),
       obf2_prefix_bytes = obf2_prefix.len(),
       preconnected = preconnect.is_some(),

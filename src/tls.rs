@@ -484,6 +484,55 @@ pub mod test_support {
     record.extend_from_slice(&handshake);
     record
   }
+
+  /// ClientHello с padding extension (имитация крупного ee ClientHello ≈1700+ байт).
+  pub fn build_client_hello_padded(sni: &str, min_record_len: usize) -> Vec<u8> {
+    let host = sni.as_bytes();
+    let mut handshake = Vec::new();
+    handshake.push(0x01);
+    handshake.extend_from_slice(&[0x00, 0x00, 0x00]);
+    handshake.extend_from_slice(&[0x03, 0x03]);
+    handshake.extend_from_slice(&[0u8; 32]);
+    handshake.push(0x00);
+    handshake.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+    handshake.push(0x01);
+    handshake.push(0x00);
+
+    let mut sni_list = Vec::new();
+    sni_list.extend_from_slice(&((host.len() as u16 + 3).to_be_bytes()));
+    sni_list.push(0x00);
+    sni_list.extend_from_slice(&(host.len() as u16).to_be_bytes());
+    sni_list.extend_from_slice(host);
+
+    let mut extensions = Vec::new();
+    extensions.extend_from_slice(&[0x00, 0x00]);
+    extensions.extend_from_slice(&(sni_list.len() as u16).to_be_bytes());
+    extensions.extend_from_slice(&sni_list);
+
+    let handshake_fixed = handshake.len() + 2;
+    let target_handshake = min_record_len.saturating_sub(5);
+    if target_handshake > handshake_fixed + extensions.len() {
+      let pad_len = target_handshake - handshake_fixed - extensions.len() - 4;
+      extensions.extend_from_slice(&[0x00, 0x15]);
+      extensions.extend_from_slice(&(pad_len as u16).to_be_bytes());
+      extensions.extend_from_slice(&vec![0u8; pad_len]);
+    }
+
+    handshake.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    handshake.extend_from_slice(&extensions);
+
+    let hs_len = handshake.len() - 4;
+    handshake[1] = ((hs_len >> 16) & 0xff) as u8;
+    handshake[2] = ((hs_len >> 8) & 0xff) as u8;
+    handshake[3] = (hs_len & 0xff) as u8;
+
+    let mut record = Vec::new();
+    record.push(0x16);
+    record.extend_from_slice(&[0x03, 0x01]);
+    record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    record.extend_from_slice(&handshake);
+    record
+  }
 }
 
 #[cfg(test)]
