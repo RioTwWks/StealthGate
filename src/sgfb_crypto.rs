@@ -140,6 +140,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for EncryptedStream<S> {
   ) -> Poll<std::io::Result<()>> {
     loop {
       if !self.pending_plain.is_empty() {
+        if buf.remaining() == 0 {
+          return Poll::Pending;
+        }
         let to_copy = self.pending_plain.len().min(buf.remaining());
         buf.put_slice(&self.pending_plain[..to_copy]);
         self.pending_plain.drain(..to_copy);
@@ -229,6 +232,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for EncryptedStream<S> {
       }
 
       if !self.read_buf.is_empty() {
+        if buf.remaining() == 0 {
+          return Poll::Pending;
+        }
         let to_copy = self.read_buf.len().min(buf.remaining());
         buf.put_slice(&self.read_buf[..to_copy]);
         self.read_buf.drain(..to_copy);
@@ -370,6 +376,64 @@ mod tests {
     let k1 = derive_session_keys("token", b"frame-a");
     let k2 = derive_session_keys("token", b"frame-b");
     assert_ne!(k1.client_to_server, k2.client_to_server);
+  }
+
+  #[tokio::test]
+  async fn encrypted_stream_copy_bidirectional_matches_lengths() {
+    use crate::proxy::copy_bidirectional_graceful;
+
+    let keys = derive_session_keys("test-token-12345678", b"opening-frame-bytes");
+    let (client_io, server_io) = tokio::io::duplex(65536);
+    let (dc_a, dc_b) = tokio::io::duplex(65536);
+
+    let client_payload = vec![0xABu8; 331];
+    let server_payload = vec![0xCDu8; 309];
+    let client_len = client_payload.len();
+    let server_len = server_payload.len();
+    let client_payload_dc = client_payload.clone();
+    let server_payload_dc = server_payload.clone();
+
+    let client = EncryptedStream::client_side(client_io, keys.clone());
+    let server = EncryptedStream::server_side(server_io, keys);
+
+    let dc_task = tokio::spawn(async move {
+      use tokio::io::{AsyncReadExt, AsyncWriteExt};
+      let mut dc_b = dc_b;
+      let mut buf = vec![0u8; 4096];
+      let n = dc_b.read(&mut buf).await.expect("dc read");
+      assert_eq!(n, client_len);
+      assert_eq!(&buf[..n], &client_payload_dc);
+      dc_b
+        .write_all(&server_payload_dc)
+        .await
+        .expect("dc write");
+      dc_b.flush().await.expect("dc flush");
+    });
+
+    let relay_task = tokio::spawn(async move {
+      let (c2s, s2c) = copy_bidirectional_graceful(server, dc_a)
+        .await
+        .expect("encrypted copy");
+      assert_eq!(c2s, client_len as u64);
+      assert_eq!(s2c, server_len as u64);
+    });
+
+    let client_task = tokio::spawn(async move {
+      use tokio::io::{AsyncReadExt, AsyncWriteExt};
+      let (mut read_half, mut write_half) = tokio::io::split(client);
+      write_half
+        .write_all(&client_payload)
+        .await
+        .expect("client write");
+      write_half.flush().await.expect("client flush");
+      let mut buf = vec![0u8; server_len];
+      read_half.read_exact(&mut buf).await.expect("client read");
+      assert_eq!(buf, server_payload);
+    });
+
+    dc_task.await.expect("dc join");
+    relay_task.await.expect("relay join");
+    client_task.await.expect("client join");
   }
 
   #[tokio::test]

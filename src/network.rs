@@ -23,7 +23,13 @@ pub async fn connect_backend(backend: &str, network: &NetworkConfig) -> Result<T
   })?
   .map_err(|err| StealthGateError::Proxy(format!("подключение к {backend}: {err}")))?;
 
+  tune_relay_stream(&stream);
   Ok(stream)
+}
+
+/// Снижает задержку relay (ACK → первый SGFB-кадр, ответ DC → клиент).
+pub fn tune_relay_stream(stream: &TcpStream) {
+  let _ = stream.set_nodelay(true);
 }
 
 async fn socks5_connect(proxy_url: &str, target: &str, timeout_secs: u64) -> Result<TcpStream> {
@@ -113,6 +119,7 @@ async fn socks5_connect(proxy_url: &str, target: &str, timeout_secs: u64) -> Res
     }
   }
 
+  tune_relay_stream(&stream);
   Ok(stream)
 }
 

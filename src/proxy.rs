@@ -260,6 +260,27 @@ fn is_benign_copy_error(err: &std::io::Error) -> bool {
   )
 }
 
+/// Копирует потоки с flush после каждого чанка (важно для AEAD-фреймов SGFB).
+async fn relay_stream_flushed<R, W>(mut reader: R, mut writer: W) -> std::io::Result<u64>
+where
+  R: tokio::io::AsyncRead + Unpin,
+  W: tokio::io::AsyncWrite + Unpin,
+{
+  use tokio::io::{AsyncReadExt, AsyncWriteExt};
+  let mut buf = [0u8; 8192];
+  let mut total = 0u64;
+  loop {
+    let n = reader.read(&mut buf).await?;
+    if n == 0 {
+      break;
+    }
+    writer.write_all(&buf[..n]).await?;
+    writer.flush().await?;
+    total += n as u64;
+  }
+  Ok(total)
+}
+
 /// Как copy_bidirectional, но не падает, если одна сторона закрыла соединение.
 pub async fn copy_bidirectional_graceful<L, R>(left: L, right: R) -> Result<(u64, u64)>
 where
@@ -270,7 +291,7 @@ where
   let (mut right_read, mut right_write) = tokio::io::split(right);
 
   let client_to_server = async {
-    let result = match tokio::io::copy(&mut left_read, &mut right_write).await {
+    let result = match relay_stream_flushed(&mut left_read, &mut right_write).await {
       Ok(n) => Ok(n),
       Err(err) if is_benign_copy_error(&err) => Ok(0),
       Err(err) => Err(err),
@@ -281,7 +302,7 @@ where
     result
   };
   let server_to_client = async {
-    let result = match tokio::io::copy(&mut right_read, &mut left_write).await {
+    let result = match relay_stream_flushed(&mut right_read, &mut left_write).await {
       Ok(n) => Ok(n),
       Err(err) if is_benign_copy_error(&err) => Ok(0),
       Err(err) => Err(err),

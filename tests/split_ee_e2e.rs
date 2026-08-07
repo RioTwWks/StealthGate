@@ -511,7 +511,7 @@ async fn split_ee_dc_response_reaches_client() {
   let partial_client_hello = full_client_hello[..1334].to_vec();
   let obf2 =
     mtproto_obfuscate::generate_test_handshake(&secret_bytes, 2, [0xdd, 0xdd, 0xdd, 0xdd]);
-  let post_obf2 = vec![0xCDu8; 128];
+  let post_obf2 = vec![0xCDu8; 331];
   let mut obf2_payload = obf2.to_vec();
   obf2_payload.extend_from_slice(&post_obf2);
 
@@ -618,7 +618,7 @@ async fn split_ee_dc_response_with_drs_reaches_client() {
   let partial_client_hello = full_client_hello[..1334].to_vec();
   let obf2 =
     mtproto_obfuscate::generate_test_handshake(&secret_bytes, 2, [0xdd, 0xdd, 0xdd, 0xdd]);
-  let post_obf2 = vec![0xCDu8; 128];
+  let post_obf2 = vec![0xCDu8; 331];
   let mut obf2_payload = obf2.to_vec();
   obf2_payload.extend_from_slice(&post_obf2);
 

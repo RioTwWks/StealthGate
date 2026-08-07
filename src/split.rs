@@ -16,6 +16,7 @@ use crate::error::{Result, StealthGateError};
 use crate::faketls::FakeTlsStream;
 use crate::io_util::PrefixedStream;
 use crate::mtproto_obfuscate::{self, ObfuscatedStream};
+use crate::network;
 use crate::proxy;
 use crate::sgfb_crypto::{self, EncryptedStream, SessionKeys};
 use crate::state::AppState;
@@ -325,7 +326,10 @@ where
 
     let preconnect = if let Some(back_addr) = first_back {
       match tokio::time::timeout(timeout, TcpStream::connect(&back_addr)).await {
-        Ok(Ok(stream)) => Some((back_addr, stream)),
+        Ok(Ok(stream)) => {
+          network::tune_relay_stream(&stream);
+          Some((back_addr, stream))
+        }
         _ => None,
       }
     } else {
@@ -398,6 +402,7 @@ where
 
     match back_stream_result {
       Ok(Ok(mut back_stream)) => {
+        network::tune_relay_stream(&back_stream);
         tracing::info!(
           back = %back_addr,
           secret_mode = ?secret_mode,
@@ -408,6 +413,12 @@ where
         if let Err(err) = back_stream.write_all(&frame).await {
           last_error = Some(StealthGateError::Proxy(format!(
             "split write к {back_addr}: {err}"
+          )));
+          continue;
+        }
+        if let Err(err) = back_stream.flush().await {
+          last_error = Some(StealthGateError::Proxy(format!(
+            "split flush к {back_addr}: {err}"
           )));
           continue;
         }
@@ -434,7 +445,7 @@ where
         match ack_result {
           Ok(()) => {
             state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
-            let back_io =
+            let mut back_io =
               wrap_relay_stream(back_stream, session_keys.clone(), relay_encrypted, true);
             let (c2b, b2c) = match front_relay {
               FrontRelay::EePlain {
@@ -446,8 +457,23 @@ where
                   encrypted = relay_encrypted,
                   "split front ee: ACK получен, старт obfuscated2 relay"
                 );
-                let client_io = PrefixedStream::new(obf2_prefix, tls_io);
-                proxy::copy_bidirectional_graceful(client_io, back_io).await?
+                // Праймим SGFB до copy: иначе back может ждать первый кадр, пока
+                // tokio::io::split ещё не запустил writer.
+                if !obf2_prefix.is_empty() {
+                  AsyncWriteExt::write_all(&mut back_io, &obf2_prefix)
+                    .await
+                    .map_err(|err| {
+                      StealthGateError::Proxy(format!("split front ee prime SGFB: {err}"))
+                    })?;
+                  AsyncWriteExt::flush(&mut back_io).await.map_err(|err| {
+                    StealthGateError::Proxy(format!("split front ee flush SGFB: {err}"))
+                  })?;
+                  tracing::debug!(
+                    bytes = obf2_prefix.len(),
+                    "split front ee: SGFB primed obf2_prefix"
+                  );
+                }
+                proxy::copy_bidirectional_graceful(tls_io, back_io).await?
               }
               FrontRelay::Plain { initial, client } => {
                 let client_io = PrefixedStream::new(initial, client);
@@ -574,6 +600,10 @@ async fn send_ack(stream: &mut (impl AsyncWrite + Unpin), ok: bool, message: Opt
       .write_all(&[ACK_OK])
       .await
       .map_err(|err| StealthGateError::Proxy(format!("split ack write: {err}")))?;
+    stream
+      .flush()
+      .await
+      .map_err(|err| StealthGateError::Proxy(format!("split ack flush: {err}")))?;
     return Ok(());
   }
 
@@ -709,13 +739,20 @@ where
     proto_tag = %hex::encode(proto_tag),
     backend = %connected_backend,
     encrypted = relay_encrypted,
-    "split back ee: relay init в DC, старт copy"
+    "split back ee: relay init в DC, ожидание obf2 от front"
   );
 
   state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
 
   let dc_stream = ObfuscatedStream::from_relay_keys(upstream, relay_keys);
   let (c2b, b2c) = proxy::copy_bidirectional_graceful(accepted.stream, dc_stream).await?;
+  if c2b == 0 && b2c == 0 {
+    tracing::warn!(
+      %peer_ip,
+      backend = %connected_backend,
+      "split back ee: сессия завершена без данных (c2b=0 b2c=0)"
+    );
+  }
   state
     .stats
     .bytes_to_backend
