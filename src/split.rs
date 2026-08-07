@@ -284,7 +284,6 @@ where
       client: C,
     },
     EePlain {
-      obf2_prefix: Vec<u8>,
       tls_io: FakeTlsStream<PrefixedStream<C>>,
     },
   }
@@ -309,7 +308,7 @@ where
 
     // Сначала obfuscated2 handshake от клиента; connect к back только после успеха —
     // иначе каждая неудачная попытка открывает TCP на EU без SGFB (early eof).
-    let (handshake, obf2_prefix, tls_io) = async {
+    let (handshake, tls_io) = async {
       let mut handshake = [0u8; mtproto_obfuscate::HANDSHAKE_LEN];
       tokio::time::timeout(timeout, tls_io.read_exact(&mut handshake))
         .await
@@ -318,8 +317,8 @@ where
       mtproto_obfuscate::parse_handshake(&handshake, &secret).ok_or_else(|| {
         StealthGateError::Proxy("split front: невалидный obfuscated2 handshake".into())
       })?;
-      let obf2_prefix = tls_io.take_read_buf();
-      Ok::<_, StealthGateError>((handshake, obf2_prefix, tls_io))
+      // read_buf (хвост obf2) остаётся в FakeTlsStream и уйдёт в copy без отдельного prefix.
+      Ok::<_, StealthGateError>((handshake, tls_io))
     }
     .await?;
 
@@ -336,14 +335,13 @@ where
       sni = ?client_hello.sni,
       tls_prefix_bytes,
       handshake_bytes = handshake.len(),
-      obf2_prefix_bytes = obf2_prefix.len(),
       preconnected = preconnect.is_some(),
       "split front: прочитан obfuscated2 handshake, передаём в SGFB initial_data"
     );
 
     (
       handshake.to_vec(),
-      FrontRelay::EePlain { obf2_prefix, tls_io },
+      FrontRelay::EePlain { tls_io },
       preconnect,
     )
   } else {
@@ -437,17 +435,12 @@ where
             let back_io =
               wrap_relay_stream(back_stream, session_keys.clone(), relay_encrypted, true);
             let (c2b, b2c) = match front_relay {
-              FrontRelay::EePlain {
-                obf2_prefix,
-                tls_io,
-              } => {
+              FrontRelay::EePlain { tls_io } => {
                 tracing::debug!(
-                  obf2_prefix_bytes = obf2_prefix.len(),
                   encrypted = relay_encrypted,
                   "split front ee: ACK получен, старт obfuscated2 relay"
                 );
-                let client_io = PrefixedStream::new(obf2_prefix, tls_io);
-                proxy::copy_bidirectional_graceful(client_io, back_io).await?
+                proxy::copy_bidirectional_graceful(tls_io, back_io).await?
               }
               FrontRelay::Plain { initial, client } => {
                 let client_io = PrefixedStream::new(initial, client);
@@ -459,7 +452,7 @@ where
               .bytes_to_backend
               .fetch_add(c2b + sgfb_initial.len() as u64, Ordering::Relaxed);
             state.stats.bytes_from_backend.fetch_add(b2c, Ordering::Relaxed);
-            tracing::debug!(
+            tracing::info!(
               back = %back_addr,
               c2b,
               b2c,
@@ -604,32 +597,12 @@ fn peer_allowed(peer_ip: IpAddr, allowlist: &[String]) -> bool {
   })
 }
 
-async fn read_front_obf2_prefix<S>(stream: &mut S, timeout: Duration) -> Result<Vec<u8>>
-where
-  S: AsyncRead + Unpin,
-{
-  let mut buf = vec![0u8; 8192];
-  let n = tokio::time::timeout(timeout, stream.read(&mut buf))
-    .await
-    .map_err(|_| {
-      StealthGateError::Proxy("split back ee: timeout ожидания obf2 от front".into())
-    })?
-    .map_err(|err| StealthGateError::Proxy(format!("split back ee: read obf2 от front: {err}")))?;
-  if n == 0 {
-    return Err(StealthGateError::Proxy(
-      "split back ee: front закрыл соединение до obf2 данных".into(),
-    ));
-  }
-  buf.truncate(n);
-  Ok(buf)
-}
-
 async fn handle_back_ee_connection<S>(
   mut front_stream: S,
   peer_ip: IpAddr,
   frame: SplitOpeningFrame,
   state: &AppState,
-  split: &SplitConfig,
+  _split: &SplitConfig,
   relay_encrypted: bool,
   session_keys: SessionKeys,
 ) -> Result<()>
@@ -673,8 +646,6 @@ where
     ));
   };
 
-  let timeout = Duration::from_secs(split.connect_timeout_secs);
-
   // ACK сразу — front может начать SGFB relay, пока back подключается к DC.
   send_ack(&mut front_stream, true, None).await?;
 
@@ -696,23 +667,23 @@ where
     .map_err(|_| StealthGateError::Config("блокировка backend_pool poisoned".into()))?
     .clone();
 
-  let mut client_stream = accepted.stream;
+  let client_stream = accepted.stream;
   let backend = frame.backend.clone();
-  let ((mut upstream, connected_backend), obf2_prefix) = tokio::try_join!(
-    pool.connect(&network, Some(&backend), &state.stats),
-    read_front_obf2_prefix(&mut client_stream, timeout)
-  )
-  .map_err(|err| {
-    if let StealthGateError::Proxy(msg) = &err {
+  let (mut upstream, connected_backend) = match pool
+    .connect(&network, Some(&backend), &state.stats)
+    .await
+  {
+    Ok(value) => value,
+    Err(err) => {
       tracing::warn!(
         %peer_ip,
         backend = %frame.backend,
-        error = %msg,
-        "split back ee: не удалось подготовить relay (DC или obf2 от front)"
+        error = %err,
+        "split back ee: не удалось подключиться к Telegram DC"
       );
+      return Err(err);
     }
-    err
-  })?;
+  };
 
   if connected_backend != frame.backend {
     tracing::info!(
@@ -722,7 +693,8 @@ where
     );
   }
 
-  // relay init только после первых obf2-данных от front (как monolith: handshake → данные → DC).
+  // Как monolith relay_ee_streams: relay init сразу после accept_handshake;
+  // obf2_prefix от front приходит через SGFB copy (без отдельного read — иначе дубликат в DC).
   let (header, relay_keys) = mtproto_obfuscate::generate_relay_init(relay_dc_id, proto_tag)?;
   upstream
     .write_all(&header)
@@ -738,16 +710,14 @@ where
     relay_dc_id,
     proto_tag = %hex::encode(proto_tag),
     backend = %connected_backend,
-    obf2_prefix_bytes = obf2_prefix.len(),
     encrypted = relay_encrypted,
-    "split back ee: obf2 от front получен, relay init в DC, старт copy"
+    "split back ee: relay init в DC, старт copy"
   );
 
   state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
 
-  let client_io = PrefixedStream::new(obf2_prefix, client_stream);
   let dc_stream = ObfuscatedStream::from_relay_keys(upstream, relay_keys);
-  let (c2b, b2c) = proxy::copy_bidirectional_graceful(client_io, dc_stream).await?;
+  let (c2b, b2c) = proxy::copy_bidirectional_graceful(client_stream, dc_stream).await?;
   state
     .stats
     .bytes_to_backend
@@ -774,6 +744,7 @@ pub async fn handle_back_connection<S>(
 where
   S: AsyncRead + AsyncWrite + Unpin,
 {
+  let _ = split;
   if !peer_allowed(peer_ip, &split.front_allowlist) {
     state.stats.split_auth_failed.fetch_add(1, Ordering::Relaxed);
     send_ack(&mut front_stream, false, Some("front IP не в allowlist"))

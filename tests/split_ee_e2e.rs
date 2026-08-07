@@ -1,7 +1,7 @@
 //! E2E: split ee + SGFB v2 encrypted relay + mock Telegram DC.
 
 use stealth_gate::config::{decode_secret, Config, SecretMode, SplitMode};
-use stealth_gate::mtproto_obfuscate;
+use stealth_gate::mtproto_obfuscate::{self, ObfuscatedStream, HANDSHAKE_LEN};
 use stealth_gate::sgfb_crypto::{derive_session_keys, EncryptedStream};
 use stealth_gate::split::{
   encode_opening_frame, handle_back_connection, relay_from_front, ACK_OK,
@@ -64,6 +64,52 @@ async fn spawn_mock_dc() -> std::net::SocketAddr {
     let _ = stream.read(&mut buf).await;
     let _ = stream.write_all(b"telegram-dc-pong").await;
     let _ = stream.shutdown().await;
+  });
+  addr
+}
+
+/// Mock DC: принимает relay init (64 байта), отвечает obfuscated2-кадром как настоящий DC.
+async fn spawn_mock_dc_relay() -> std::net::SocketAddr {
+  let listener = TcpListener::bind("127.0.0.1:0").await.expect("dc bind");
+  let addr = listener.local_addr().expect("dc addr");
+  tokio::spawn(async move {
+    let (mut stream, _) = listener.accept().await.expect("dc accept");
+    let mut relay_hs = [0u8; HANDSHAKE_LEN];
+    if stream.read_exact(&mut relay_hs).await.is_err() {
+      return;
+    }
+
+    let mut reversed = [0u8; HANDSHAKE_LEN];
+    for i in 0..HANDSHAKE_LEN {
+      reversed[i] = relay_hs[HANDSHAKE_LEN - 1 - i];
+    }
+    let enc_key: [u8; 32] = relay_hs[8..40].try_into().expect("enc key");
+    let enc_iv: [u8; 16] = relay_hs[40..56].try_into().expect("enc iv");
+    let dec_key: [u8; 32] = reversed[8..40].try_into().expect("dec key");
+    let dec_iv: [u8; 16] = reversed[40..56].try_into().expect("dec iv");
+
+    use cipher::KeyIvInit;
+    use ctr::Ctr128BE;
+    use aes::Aes256;
+    type AesCtr256 = Ctr128BE<Aes256>;
+
+    let relay_keys = mtproto_obfuscate::RelayKeys {
+      enc: AesCtr256::new_from_slices(&enc_key, &enc_iv).expect("relay enc"),
+      dec: AesCtr256::new_from_slices(&dec_key, &dec_iv).expect("relay dec"),
+    };
+
+    let mut dc_stream = ObfuscatedStream::from_relay_keys(stream, relay_keys);
+    let mut buf = [0u8; 4096];
+    let n = tokio::io::AsyncReadExt::read(&mut dc_stream, &mut buf)
+      .await
+      .unwrap_or(0);
+    if n == 0 {
+      return;
+    }
+
+    let response = vec![0xABu8; 309];
+    let _ = tokio::io::AsyncWriteExt::write_all(&mut dc_stream, &response).await;
+    let _ = dc_stream.shutdown().await;
   });
   addr
 }
@@ -398,5 +444,112 @@ async fn split_ee_partial_client_hello_obf2_without_tail() {
       );
     }
     Err(_) => panic!("relay_from_front timeout on obf2 without ch tail"),
+  }
+}
+
+/// DC отвечает 309 байт через relay obfuscation — клиент должен получить ответ (b2c>0).
+#[tokio::test]
+async fn split_ee_dc_response_reaches_client() {
+  let dir = tempdir().expect("tempdir");
+  let users_file = dir.path().join("users.json").to_string_lossy().to_string();
+
+  let dc_addr = spawn_mock_dc_relay().await;
+  let dc_backend = format!("{dc_addr}");
+
+  let back_listener = TcpListener::bind("127.0.0.1:0").await.expect("back bind");
+  let back_addr = back_listener.local_addr().expect("back addr");
+
+  let back_config_path = dir.path().join("back.toml");
+  let back_config = ee_test_config(&users_file, &dc_backend, &back_addr.to_string());
+  back_config
+    .save_to_file(&back_config_path)
+    .expect("save back");
+  let back_state = AppState::new(back_config, back_config_path.to_string_lossy()).expect("back state");
+  let back_split = back_state.config.read().expect("read").split.clone();
+
+  tokio::spawn(async move {
+    loop {
+      let (stream, peer) = back_listener.accept().await.expect("back accept");
+      let state = back_state.clone();
+      let split_cfg = back_split.clone();
+      tokio::spawn(async move {
+        let _ = handle_back_connection(stream, peer.ip(), &state, &split_cfg).await;
+      });
+    }
+  });
+  tokio::task::yield_now().await;
+
+  let front_config_path = dir.path().join("front.toml");
+  let front_config = front_test_config(&users_file, &back_addr.to_string());
+  front_config
+    .save_to_file(&front_config_path)
+    .expect("save front");
+  let front_state = AppState::new(front_config, front_config_path.to_string_lossy()).expect("front state");
+  let front_split = front_state.config.read().expect("read").split.clone();
+
+  let secret_bytes = decode_secret(EE_SECRET).expect("secret");
+  let full_client_hello =
+    stealth_gate::faketls::build_signed_client_hello_min_len(FAKE_DOMAIN, &secret_bytes, 1760);
+  let partial_client_hello = full_client_hello[..1334].to_vec();
+  let obf2 =
+    mtproto_obfuscate::generate_test_handshake(&secret_bytes, 2, [0xdd, 0xdd, 0xdd, 0xdd]);
+  let post_obf2 = vec![0xCDu8; 128];
+  let mut obf2_payload = obf2.to_vec();
+  obf2_payload.extend_from_slice(&post_obf2);
+
+  let (mut tg_client, server_end) = tokio::io::duplex(65536);
+  let response_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+  let response_bytes_task = response_bytes.clone();
+  let client_task = tokio::spawn(async move {
+    let mut server_hello_buf = vec![0u8; 8192];
+    let n = tg_client.read(&mut server_hello_buf).await.expect("read sh");
+    assert!(n > 100, "ожидался Fake TLS ServerHello");
+    tg_client
+      .write_all(&wrap_tls_app_data(&obf2_payload))
+      .await
+      .expect("write obf2");
+
+    let mut resp = vec![0u8; 8192];
+    let read_n = tokio::time::timeout(std::time::Duration::from_secs(5), tg_client.read(&mut resp))
+      .await
+      .expect("timeout waiting DC response")
+      .expect("read response");
+    response_bytes_task.store(read_n, std::sync::atomic::Ordering::Relaxed);
+    let _ = tg_client.shutdown().await;
+  });
+
+  let relay_handle = tokio::spawn(async move {
+    relay_from_front(
+      server_end,
+      &partial_client_hello,
+      &dc_backend,
+      SecretMode::Ee,
+      None,
+      &front_split,
+      &front_state,
+    )
+    .await
+  });
+
+  client_task.await.expect("client join");
+
+  assert!(
+    response_bytes.load(std::sync::atomic::Ordering::Relaxed) > 0,
+    "клиент не получил ответ от DC через relay"
+  );
+
+  match tokio::time::timeout(std::time::Duration::from_secs(3), relay_handle).await {
+    Ok(Ok(Ok(()))) => {}
+    Ok(Ok(Err(err))) => {
+      let msg = err.to_string();
+      assert!(
+        msg.contains("copy_bidirectional") || msg.contains("broken pipe") || msg.contains("UnexpectedEof"),
+        "unexpected relay error: {msg}"
+      );
+    }
+    _ => {
+      // после shutdown клиента relay может ещё завершаться — главное, что ответ дошёл
+    }
   }
 }
