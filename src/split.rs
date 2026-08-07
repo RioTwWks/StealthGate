@@ -365,9 +365,7 @@ where
           Ok::<_, StealthGateError>((handshake, obf2_prefix, tls_io))
         },
         async {
-          let Some(handle) = back_connect else {
-            return None;
-          };
+          let handle = back_connect?;
           match handle.await {
             Ok(Ok(Ok(stream))) => Some((back_addr, stream)),
             _ => None,
