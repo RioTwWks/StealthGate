@@ -200,9 +200,9 @@ fn wrap_relay_stream<S>(
 ) -> EitherRelayStream<S> {
   if encrypted {
     if client_side {
-      EitherRelayStream::Encrypted(EncryptedStream::client_side(stream, keys))
+      EitherRelayStream::Encrypted(Box::new(EncryptedStream::client_side(stream, keys)))
     } else {
-      EitherRelayStream::Encrypted(EncryptedStream::server_side(stream, keys))
+      EitherRelayStream::Encrypted(Box::new(EncryptedStream::server_side(stream, keys)))
     }
   } else {
     EitherRelayStream::Plain(stream)
@@ -211,7 +211,7 @@ fn wrap_relay_stream<S>(
 
 enum EitherRelayStream<S> {
   Plain(S),
-  Encrypted(EncryptedStream<S>),
+  Encrypted(Box<EncryptedStream<S>>),
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for EitherRelayStream<S> {
@@ -222,7 +222,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for EitherRelayStream<S> {
   ) -> Poll<std::io::Result<()>> {
     match &mut *self {
       EitherRelayStream::Plain(inner) => Pin::new(inner).poll_read(cx, buf),
-      EitherRelayStream::Encrypted(inner) => Pin::new(inner).poll_read(cx, buf),
+      EitherRelayStream::Encrypted(inner) => Pin::new(inner.as_mut()).poll_read(cx, buf),
     }
   }
 }
@@ -235,21 +235,21 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for EitherRelayStream<S> {
   ) -> Poll<std::io::Result<usize>> {
     match &mut *self {
       EitherRelayStream::Plain(inner) => Pin::new(inner).poll_write(cx, buf),
-      EitherRelayStream::Encrypted(inner) => Pin::new(inner).poll_write(cx, buf),
+      EitherRelayStream::Encrypted(inner) => Pin::new(inner.as_mut()).poll_write(cx, buf),
     }
   }
 
   fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
     match &mut *self {
       EitherRelayStream::Plain(inner) => Pin::new(inner).poll_flush(cx),
-      EitherRelayStream::Encrypted(inner) => Pin::new(inner).poll_flush(cx),
+      EitherRelayStream::Encrypted(inner) => Pin::new(inner.as_mut()).poll_flush(cx),
     }
   }
 
   fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
     match &mut *self {
       EitherRelayStream::Plain(inner) => Pin::new(inner).poll_shutdown(cx),
-      EitherRelayStream::Encrypted(inner) => Pin::new(inner).poll_shutdown(cx),
+      EitherRelayStream::Encrypted(inner) => Pin::new(inner.as_mut()).poll_shutdown(cx),
     }
   }
 }
