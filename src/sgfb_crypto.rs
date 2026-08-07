@@ -154,6 +154,12 @@ impl<S: AsyncRead + Unpin> AsyncRead for EncryptedStream<S> {
             match Pin::new(&mut self.inner).poll_read(cx, &mut tmp_buf) {
               Poll::Ready(Ok(())) => {
                 if tmp_buf.filled().is_empty() {
+                  if self.header_filled > 0 {
+                    return Poll::Ready(Err(std::io::Error::new(
+                      std::io::ErrorKind::UnexpectedEof,
+                      "SGFB frame header truncated",
+                    )));
+                  }
                   return Poll::Ready(Ok(()));
                 }
                 let idx = self.header_filled;
@@ -186,6 +192,12 @@ impl<S: AsyncRead + Unpin> AsyncRead for EncryptedStream<S> {
             Poll::Ready(Ok(())) => {
               let n = tmp_buf.filled().len();
               if n == 0 {
+                if self.frame_filled > 0 {
+                  return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "SGFB frame body truncated",
+                  )));
+                }
                 return Poll::Ready(Ok(()));
               }
               let filled = self.frame_filled;

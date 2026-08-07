@@ -604,26 +604,6 @@ fn peer_allowed(peer_ip: IpAddr, allowlist: &[String]) -> bool {
   })
 }
 
-async fn read_first_obf2_from_front<S>(stream: &mut S, timeout: Duration) -> Result<Vec<u8>>
-where
-  S: AsyncRead + Unpin,
-{
-  let mut buf = vec![0u8; 8192];
-  let n = tokio::time::timeout(timeout, stream.read(&mut buf))
-    .await
-    .map_err(|_| {
-      StealthGateError::Proxy("split back ee: timeout ожидания obf2 от front".into())
-    })?
-    .map_err(|err| StealthGateError::Proxy(format!("split back ee: read obf2 от front: {err}")))?;
-  if n == 0 {
-    return Err(StealthGateError::Proxy(
-      "split back ee: front закрыл соединение до obf2 данных".into(),
-    ));
-  }
-  buf.truncate(n);
-  Ok(buf)
-}
-
 async fn handle_back_ee_connection<S>(
   mut front_stream: S,
   peer_ip: IpAddr,
@@ -678,7 +658,6 @@ where
 
   let front_io = wrap_relay_stream(front_stream, session_keys, relay_encrypted, false);
   let prefixed = PrefixedStream::new(frame.initial_data, front_io);
-  let accepted = mtproto_obfuscate::accept_handshake(prefixed, &secret).await?;
 
   let network = {
     let config = state
@@ -694,30 +673,17 @@ where
     .map_err(|_| StealthGateError::Config("блокировка backend_pool poisoned".into()))?
     .clone();
 
-  let client_stream = accepted.stream;
   let backend = frame.backend.clone();
   let timeout = Duration::from_secs(split.connect_timeout_secs);
 
-  // Параллельно: connect к DC и первый obf2-чанк от front (после ACK front шлёт obf2_prefix).
-  let ((mut upstream, connected_backend), (stream, first_obf2)) = tokio::try_join!(
-    pool.connect(&network, Some(&backend), &state.stats),
+  let (accepted, (mut upstream, connected_backend)) = tokio::try_join!(
+    mtproto_obfuscate::accept_handshake(prefixed, &secret),
     async {
-      let mut stream = client_stream;
-      let chunk = read_first_obf2_from_front(&mut stream, timeout).await?;
-      Ok::<_, StealthGateError>((stream, chunk))
+      tokio::time::timeout(timeout, pool.connect(&network, Some(&backend), &state.stats))
+        .await
+        .map_err(|_| StealthGateError::Proxy("split back ee: timeout подключения к DC".into()))?
     }
-  )
-  .map_err(|err| {
-    if let StealthGateError::Proxy(msg) = &err {
-      tracing::warn!(
-        %peer_ip,
-        backend = %frame.backend,
-        error = %msg,
-        "split back ee: не удалось подготовить relay (DC или obf2 от front)"
-      );
-    }
-    err
-  })?;
+  )?;
 
   if connected_backend != frame.backend {
     tracing::info!(
@@ -727,7 +693,6 @@ where
     );
   }
 
-  // relay_init только после первых obf2-данных от front (как monolith после handshake).
   let (header, relay_keys) = mtproto_obfuscate::generate_relay_init(relay_dc_id, proto_tag)?;
   upstream
     .write_all(&header)
@@ -743,16 +708,14 @@ where
     relay_dc_id,
     proto_tag = %hex::encode(proto_tag),
     backend = %connected_backend,
-    first_obf2_bytes = first_obf2.len(),
     encrypted = relay_encrypted,
-    "split back ee: obf2 от front, relay init в DC, старт copy"
+    "split back ee: relay init в DC, старт copy"
   );
 
   state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
 
-  let client_io = PrefixedStream::new(first_obf2, stream);
   let dc_stream = ObfuscatedStream::from_relay_keys(upstream, relay_keys);
-  let (c2b, b2c) = proxy::copy_bidirectional_graceful(client_io, dc_stream).await?;
+  let (c2b, b2c) = proxy::copy_bidirectional_graceful(accepted.stream, dc_stream).await?;
   state
     .stats
     .bytes_to_backend

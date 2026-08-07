@@ -32,6 +32,15 @@ fn ee_test_config(users_file: &str, dc_addr: &str, back_listen: &str) -> Config 
   config
 }
 
+fn ee_test_config_with_drs(users_file: &str, dc_addr: &str, back_listen: &str) -> Config {
+  let mut config = ee_test_config(users_file, dc_addr, back_listen);
+  config.drs.enabled = true;
+  config.drs.ee_relay = true;
+  config.drs.record_sizes = vec![512, 1024, 256];
+  config.drs.jitter_ms = 5;
+  config
+}
+
 fn front_test_config(users_file: &str, back_addr: &str) -> Config {
   let mut config = Config::test_minimal(users_file);
   config.tls.fake_domain = FAKE_DOMAIN.into();
@@ -43,6 +52,15 @@ fn front_test_config(users_file: &str, back_addr: &str) -> Config {
   config.split.encrypt_relay = true;
   config.split.connect_timeout_secs = 5;
   config.drs.ee_relay = false;
+  config
+}
+
+fn front_test_config_with_drs(users_file: &str, back_addr: &str) -> Config {
+  let mut config = front_test_config(users_file, back_addr);
+  config.drs.enabled = true;
+  config.drs.ee_relay = true;
+  config.drs.record_sizes = vec![512, 1024, 256];
+  config.drs.jitter_ms = 5;
   config
 }
 
@@ -552,4 +570,99 @@ async fn split_ee_dc_response_reaches_client() {
       // после shutdown клиента relay может ещё завершаться — главное, что ответ дошёл
     }
   }
+}
+
+/// Как split_ee_dc_response_reaches_client, но с production-like DRS (ee_relay + jitter).
+#[tokio::test]
+async fn split_ee_dc_response_with_drs_reaches_client() {
+  let dir = tempdir().expect("tempdir");
+  let users_file = dir.path().join("users.json").to_string_lossy().to_string();
+
+  let dc_addr = spawn_mock_dc_relay().await;
+  let dc_backend = format!("{dc_addr}");
+
+  let back_listener = TcpListener::bind("127.0.0.1:0").await.expect("back bind");
+  let back_addr = back_listener.local_addr().expect("back addr");
+
+  let back_config_path = dir.path().join("back.toml");
+  let back_config = ee_test_config_with_drs(&users_file, &dc_backend, &back_addr.to_string());
+  back_config
+    .save_to_file(&back_config_path)
+    .expect("save back");
+  let back_state = AppState::new(back_config, back_config_path.to_string_lossy()).expect("back state");
+  let back_split = back_state.config.read().expect("read").split.clone();
+
+  tokio::spawn(async move {
+    loop {
+      let (stream, peer) = back_listener.accept().await.expect("back accept");
+      let state = back_state.clone();
+      let split_cfg = back_split.clone();
+      tokio::spawn(async move {
+        let _ = handle_back_connection(stream, peer.ip(), &state, &split_cfg).await;
+      });
+    }
+  });
+  tokio::task::yield_now().await;
+
+  let front_config_path = dir.path().join("front.toml");
+  let front_config = front_test_config_with_drs(&users_file, &back_addr.to_string());
+  front_config
+    .save_to_file(&front_config_path)
+    .expect("save front");
+  let front_state = AppState::new(front_config, front_config_path.to_string_lossy()).expect("front state");
+  let front_split = front_state.config.read().expect("read").split.clone();
+
+  let secret_bytes = decode_secret(EE_SECRET).expect("secret");
+  let full_client_hello =
+    stealth_gate::faketls::build_signed_client_hello_min_len(FAKE_DOMAIN, &secret_bytes, 1760);
+  let partial_client_hello = full_client_hello[..1334].to_vec();
+  let obf2 =
+    mtproto_obfuscate::generate_test_handshake(&secret_bytes, 2, [0xdd, 0xdd, 0xdd, 0xdd]);
+  let post_obf2 = vec![0xCDu8; 128];
+  let mut obf2_payload = obf2.to_vec();
+  obf2_payload.extend_from_slice(&post_obf2);
+
+  let (mut tg_client, server_end) = tokio::io::duplex(65536);
+  let response_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+  let response_bytes_task = response_bytes.clone();
+  let client_task = tokio::spawn(async move {
+    let mut server_hello_buf = vec![0u8; 8192];
+    let n = tg_client.read(&mut server_hello_buf).await.expect("read sh");
+    assert!(n > 100, "ожидался Fake TLS ServerHello");
+    tg_client
+      .write_all(&wrap_tls_app_data(&obf2_payload))
+      .await
+      .expect("write obf2");
+
+    let mut resp = vec![0u8; 8192];
+    let read_n = tokio::time::timeout(std::time::Duration::from_secs(5), tg_client.read(&mut resp))
+      .await
+      .expect("timeout waiting DC response")
+      .expect("read response");
+    response_bytes_task.store(read_n, std::sync::atomic::Ordering::Relaxed);
+    let _ = tg_client.shutdown().await;
+  });
+
+  let relay_handle = tokio::spawn(async move {
+    relay_from_front(
+      server_end,
+      &partial_client_hello,
+      &dc_backend,
+      SecretMode::Ee,
+      None,
+      &front_split,
+      &front_state,
+    )
+    .await
+  });
+
+  client_task.await.expect("client join");
+
+  assert!(
+    response_bytes.load(std::sync::atomic::Ordering::Relaxed) > 0,
+    "клиент не получил ответ от DC через relay с DRS"
+  );
+
+  let _ = tokio::time::timeout(std::time::Duration::from_secs(3), relay_handle).await;
 }

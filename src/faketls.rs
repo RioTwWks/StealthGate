@@ -49,7 +49,8 @@ impl FakeTlsWriteOptions {
     };
     Some(Self {
       record_sizes,
-      padding: true,
+      // Padding внутри TLS Application Data ломает непрерывный obfuscated2 CTR-поток.
+      padding: false,
     })
   }
 }
