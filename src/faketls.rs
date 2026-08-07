@@ -484,7 +484,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for FakeTlsStream<S> {
           Poll::Ready(Ok(_)) => {
             Self::abandon_incomplete_handshake_if_app_data_follows(&mut self.tls_stash, before);
             if self.tls_stash.len() == before {
-              return Poll::Ready(Ok(()));
+              return Poll::Pending;
             }
           }
           Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),

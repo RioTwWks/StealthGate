@@ -88,6 +88,8 @@ pub struct EncryptedStream<S> {
   decrypt: DirectionCipher,
   read_buf: Vec<u8>,
   pending_plain: Vec<u8>,
+  header_buf: [u8; 2],
+  header_filled: usize,
   frame_len: Option<usize>,
   frame_filled: usize,
   frame_buf: Vec<u8>,
@@ -120,6 +122,8 @@ impl<S> EncryptedStream<S> {
       decrypt,
       read_buf: Vec::new(),
       pending_plain: Vec::new(),
+      header_buf: [0u8; 2],
+      header_filled: 0,
       frame_len: None,
       frame_filled: 0,
       frame_buf: Vec::new(),
@@ -144,15 +148,24 @@ impl<S: AsyncRead + Unpin> AsyncRead for EncryptedStream<S> {
 
       if self.read_buf.is_empty() {
         if self.frame_len.is_none() {
-          let mut header = [0u8; 2];
-          let mut header_buf = ReadBuf::new(&mut header);
-          match Pin::new(&mut self.inner).poll_read(cx, &mut header_buf) {
-            Poll::Ready(Ok(())) if header_buf.filled().len() == 2 => {}
-            Poll::Ready(Ok(())) => return Poll::Ready(Ok(())),
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            Poll::Pending => return Poll::Pending,
+          while self.header_filled < 2 {
+            let mut tmp = [0u8; 1];
+            let mut tmp_buf = ReadBuf::new(&mut tmp);
+            match Pin::new(&mut self.inner).poll_read(cx, &mut tmp_buf) {
+              Poll::Ready(Ok(())) => {
+                if tmp_buf.filled().is_empty() {
+                  return Poll::Ready(Ok(()));
+                }
+                let idx = self.header_filled;
+                self.header_buf[idx] = tmp[0];
+                self.header_filled += 1;
+              }
+              Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+              Poll::Pending => return Poll::Pending,
+            }
           }
-          let len = u16::from_be_bytes(header) as usize;
+          let len = u16::from_be_bytes(self.header_buf) as usize;
+          self.header_filled = 0;
           if len == 0 || len > MAX_FRAME_CIPHER {
             return Poll::Ready(Err(std::io::Error::new(
               std::io::ErrorKind::InvalidData,
@@ -177,7 +190,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for EncryptedStream<S> {
               }
               let filled = self.frame_filled;
               self.frame_buf[filled..filled + n].copy_from_slice(&tmp[..n]);
-              self.frame_filled = filled + n;
+              self.frame_filled += n;
               if self.frame_filled < needed {
                 return Poll::Pending;
               }
@@ -345,5 +358,43 @@ mod tests {
     let k1 = derive_session_keys("token", b"frame-a");
     let k2 = derive_session_keys("token", b"frame-b");
     assert_ne!(k1.client_to_server, k2.client_to_server);
+  }
+
+  #[tokio::test]
+  async fn encrypted_stream_handles_split_frame_header() {
+    let payload = b"mtproto-init-payload";
+
+    // Собираем полный AEAD-кадр и режем заголовок на 2 части по 1 байту.
+    let mut wire = Vec::new();
+    {
+      let (left, right) = tokio::io::duplex(8192);
+      let (mut enc, mut raw) = (
+        EncryptedStream::client_side(left, derive_session_keys("test-token-12345678", b"opening-frame-bytes")),
+        right,
+      );
+      enc.write_all(payload).await.expect("encode");
+      enc.flush().await.expect("flush");
+      drop(enc);
+      raw.read_to_end(&mut wire).await.expect("read wire");
+    }
+    assert!(wire.len() > 2);
+
+    let (left, right) = tokio::io::duplex(wire.len() + 16);
+    tokio::spawn(async move {
+      use tokio::io::AsyncWriteExt;
+      let mut left = left;
+      left.write_all(&wire[..1]).await.expect("byte 0");
+      left.write_all(&wire[1..2]).await.expect("byte 1");
+      left.write_all(&wire[2..]).await.expect("body");
+      left.shutdown().await.ok();
+    });
+
+    let mut split_server = EncryptedStream::server_side(right, derive_session_keys("test-token-12345678", b"opening-frame-bytes"));
+    let mut server_buf = vec![0u8; payload.len()];
+    split_server
+      .read_exact(&mut server_buf)
+      .await
+      .expect("split header read");
+    assert_eq!(&server_buf, payload);
   }
 }
