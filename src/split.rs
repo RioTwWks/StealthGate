@@ -293,13 +293,6 @@ where
     let secret = proxy::resolve_secret_bytes(state, secret_label)?;
     let timeout = Duration::from_secs(split.connect_timeout_secs);
     let first_back = split.back_servers.first().cloned();
-    // Connect к back параллельно с ClientHello/ServerHello (не ждём handshake).
-    let back_connect = first_back.as_ref().map(|back_addr| {
-      let back_addr = back_addr.clone();
-      tokio::spawn(async move {
-        tokio::time::timeout(timeout, TcpStream::connect(&back_addr)).await
-      })
-    });
 
     let (client_hello_buf, client_hello) =
       prepare_ee_client_hello(&mut client, initial_data, &secret).await?;
@@ -314,49 +307,29 @@ where
       write_opts.clone(),
     );
 
-    let (handshake, obf2_prefix, tls_io, preconnect) = if let Some(back_addr) = first_back {
-      let (io_result, preconnect) = tokio::join!(
-        async {
-          let mut handshake = [0u8; mtproto_obfuscate::HANDSHAKE_LEN];
-          tokio::time::timeout(timeout, tls_io.read_exact(&mut handshake))
-            .await
-            .map_err(|_| {
-              StealthGateError::Proxy("split front ee handshake timeout".into())
-            })?
-            .map_err(|err| {
-              StealthGateError::Proxy(format!("split front ee handshake: {err}"))
-            })?;
-          mtproto_obfuscate::parse_handshake(&handshake, &secret).ok_or_else(|| {
-            StealthGateError::Proxy("split front: невалидный obfuscated2 handshake".into())
-          })?;
-          let obf2_prefix = tls_io.take_read_buf();
-          Ok::<_, StealthGateError>((handshake, obf2_prefix, tls_io))
-        },
-        async {
-          let handle = back_connect?;
-          match handle.await {
-            Ok(Ok(Ok(stream))) => Some((back_addr, stream)),
-            _ => None,
-          }
-        }
-      );
-      let (handshake, obf2_prefix, tls_io) = io_result?;
-      (handshake, obf2_prefix, tls_io, preconnect)
-    } else {
-      let (handshake, obf2_prefix, tls_io) = async {
-        let mut handshake = [0u8; mtproto_obfuscate::HANDSHAKE_LEN];
-        tls_io
-          .read_exact(&mut handshake)
-          .await
-          .map_err(|err| StealthGateError::Proxy(format!("split front ee handshake: {err}")))?;
-        mtproto_obfuscate::parse_handshake(&handshake, &secret).ok_or_else(|| {
-          StealthGateError::Proxy("split front: невалидный obfuscated2 handshake".into())
-        })?;
-        let obf2_prefix = tls_io.take_read_buf();
-        Ok::<_, StealthGateError>((handshake, obf2_prefix, tls_io))
+    // Сначала obfuscated2 handshake от клиента; connect к back только после успеха —
+    // иначе каждая неудачная попытка открывает TCP на EU без SGFB (early eof).
+    let (handshake, obf2_prefix, tls_io) = async {
+      let mut handshake = [0u8; mtproto_obfuscate::HANDSHAKE_LEN];
+      tokio::time::timeout(timeout, tls_io.read_exact(&mut handshake))
+        .await
+        .map_err(|_| StealthGateError::Proxy("split front ee handshake timeout".into()))?
+        .map_err(|err| StealthGateError::Proxy(format!("split front ee handshake: {err}")))?;
+      mtproto_obfuscate::parse_handshake(&handshake, &secret).ok_or_else(|| {
+        StealthGateError::Proxy("split front: невалидный obfuscated2 handshake".into())
+      })?;
+      let obf2_prefix = tls_io.take_read_buf();
+      Ok::<_, StealthGateError>((handshake, obf2_prefix, tls_io))
+    }
+    .await?;
+
+    let preconnect = if let Some(back_addr) = first_back {
+      match tokio::time::timeout(timeout, TcpStream::connect(&back_addr)).await {
+        Ok(Ok(stream)) => Some((back_addr, stream)),
+        _ => None,
       }
-      .await?;
-      (handshake, obf2_prefix, tls_io, None)
+    } else {
+      None
     };
 
     tracing::debug!(
