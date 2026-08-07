@@ -147,11 +147,16 @@ fn byte_to_secret_mode(value: u8) -> Result<SecretMode> {
 }
 
 /// Дочитывает TLS ClientHello; при неполной записи шлёт ServerHello, чтобы разблокировать клиента.
+/// Если хвост ClientHello не приходит (типично peek=1334 при needed≈1728), продолжаем с partial
+/// — Telegram после ServerHello шлёт obfuscated2 как TLS Application Data, FakeTlsStream пропустит
+/// оставшиеся handshake-записи (0x16).
 async fn prepare_ee_client_hello<C: AsyncRead + AsyncWrite + Unpin>(
   client: &mut C,
   initial: &[u8],
   secret: &[u8],
 ) -> Result<(Vec<u8>, crate::faketls::ParsedClientHello)> {
+  const CLIENT_HELLO_TAIL_WAIT: Duration = Duration::from_secs(2);
+
   let mut buf = initial.to_vec();
   let needed = crate::tls::tls_record_total_len(&buf);
   let mut server_hello_sent = false;
@@ -167,34 +172,42 @@ async fn prepare_ee_client_hello<C: AsyncRead + AsyncWrite + Unpin>(
         "split front ee: неполный ClientHello, отправлен ранний ServerHello"
       );
 
-      let remaining = needed - buf.len();
-      let mut tail = vec![0u8; remaining];
-      let deadline = Duration::from_secs(10);
-      match tokio::time::timeout(deadline, client.read_exact(&mut tail)).await {
-        Ok(Ok(_)) => buf.extend_from_slice(&tail),
-        Ok(Err(err)) => {
-          return Err(StealthGateError::Proxy(format!(
-            "ClientHello tail after ServerHello: {err}"
-          )));
+      let deadline = tokio::time::Instant::now() + CLIENT_HELLO_TAIL_WAIT;
+      while buf.len() < needed && tokio::time::Instant::now() < deadline {
+        let mut chunk = [0u8; 2048];
+        let read_fut = client.read(&mut chunk);
+        let remaining_ms = deadline
+          .saturating_duration_since(tokio::time::Instant::now())
+          .as_millis() as u64;
+        if remaining_ms == 0 {
+          break;
         }
-        Err(_) => {
-          tracing::debug!(
-            peek_len = buf.len(),
-            needed,
-            remaining,
-            "split front ee: таймаут дочитывания ClientHello после ServerHello"
-          );
+        match tokio::time::timeout(Duration::from_millis(remaining_ms.max(1)), read_fut).await {
+          Ok(Ok(0)) => break,
+          Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+          Ok(Err(err)) => {
+            return Err(StealthGateError::Proxy(format!(
+              "ClientHello tail after ServerHello: {err}"
+            )));
+          }
+          Err(_) => break,
         }
       }
-    }
-  }
 
-  if let Some(needed) = needed {
-    if buf.len() < needed {
-      return Err(StealthGateError::Proxy(format!(
-        "неполный ClientHello: {} из {needed} байт",
-        buf.len()
-      )));
+      if buf.len() < needed {
+        tracing::debug!(
+          peek_len = buf.len(),
+          needed,
+          remaining = needed - buf.len(),
+          "split front ee: хвост ClientHello не получен, продолжаем через FakeTlsStream"
+        );
+        if crate::faketls::validate_client_hello(&partial, secret).is_err() {
+          tracing::debug!(
+            "split front ee: partial ClientHello без полной HMAC-проверки (probable ee на acceptor)"
+          );
+        }
+        return Ok((buf, partial));
+      }
     }
   }
 
