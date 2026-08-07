@@ -345,6 +345,8 @@ pub struct FakeTlsStream<S> {
   read_buf: Vec<u8>,
   write_opts: Option<FakeTlsWriteOptions>,
   write_size_idx: usize,
+  /// Буфер для сборки TLS-записей (peek + хвост ClientHello + следующие кадры).
+  tls_stash: Vec<u8>,
 }
 
 impl<S> FakeTlsStream<S> {
@@ -358,6 +360,7 @@ impl<S> FakeTlsStream<S> {
       read_buf: Vec::new(),
       write_opts,
       write_size_idx: 0,
+      tls_stash: Vec::new(),
     }
   }
 
@@ -398,6 +401,48 @@ impl<S> FakeTlsStream<S> {
   }
 }
 
+fn looks_like_tls_record_header(data: &[u8]) -> bool {
+  data.len() >= 3
+    && matches!(
+      data[0],
+      TLS_HANDSHAKE | TLS_APPLICATION_DATA | TLS_CHANGE_CIPHER_SPEC
+    )
+    && data[1] == 0x03
+    && matches!(data[2], 0x01 | 0x03)
+}
+
+impl<S: AsyncRead + Unpin> FakeTlsStream<S> {
+  fn poll_fill_tls_stash(
+    mut self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+  ) -> Poll<std::io::Result<usize>> {
+    let mut tmp = [0u8; 2048];
+    let mut tmp_buf = ReadBuf::new(&mut tmp);
+    match Pin::new(&mut self.inner).poll_read(cx, &mut tmp_buf) {
+      Poll::Ready(Ok(())) => {
+        let n = tmp_buf.filled().len();
+        if n > 0 {
+          self.tls_stash.extend_from_slice(&tmp[..n]);
+        }
+        Poll::Ready(Ok(n))
+      }
+      Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+      Poll::Pending => Poll::Pending,
+    }
+  }
+
+  /// Если клиент не дослал хвост ClientHello (0x16), а сразу шлёт obfuscated2 (0x17),
+  /// отбрасываем неполную handshake-запись и продолжаем с Application Data.
+  fn abandon_incomplete_handshake_if_app_data_follows(stash: &mut Vec<u8>, before: usize) {
+    if stash.is_empty() || stash[0] != TLS_HANDSHAKE || before >= stash.len() {
+      return;
+    }
+    if stash[before] == TLS_APPLICATION_DATA && stash.get(before + 1) == Some(&0x03) {
+      stash.drain(..before);
+    }
+  }
+}
+
 impl<S: AsyncRead + Unpin> AsyncRead for FakeTlsStream<S> {
   fn poll_read(
     mut self: Pin<&mut Self>,
@@ -412,37 +457,63 @@ impl<S: AsyncRead + Unpin> AsyncRead for FakeTlsStream<S> {
         return Poll::Ready(Ok(()));
       }
 
-      let mut header = [0u8; 5];
-      let mut header_buf = ReadBuf::new(&mut header);
-      match Pin::new(&mut self.inner).poll_read(cx, &mut header_buf) {
-        Poll::Ready(Ok(())) if header_buf.filled().len() == 5 => {}
-        Poll::Ready(Ok(())) => return Poll::Ready(Ok(())),
-        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-        Poll::Pending => return Poll::Pending,
+      while self.tls_stash.len() >= 5 {
+        let payload_len = u16::from_be_bytes([self.tls_stash[3], self.tls_stash[4]]) as usize;
+        if payload_len > MAX_TLS_PAYLOAD + 2048 {
+          return Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "TLS record too large",
+          )));
+        }
+        let total = 5 + payload_len;
+
+        if self.tls_stash.len() >= total {
+          let record_type = self.tls_stash[0];
+          let payload = self.tls_stash[5..total].to_vec();
+          self.tls_stash.drain(..total);
+          if record_type == TLS_APPLICATION_DATA {
+            self.read_buf = payload;
+            break;
+          }
+          continue;
+        }
+
+        let before = self.tls_stash.len();
+        match self.as_mut().poll_fill_tls_stash(cx) {
+          Poll::Ready(Ok(0)) => return Poll::Ready(Ok(())),
+          Poll::Ready(Ok(_)) => {
+            Self::abandon_incomplete_handshake_if_app_data_follows(&mut self.tls_stash, before);
+            if self.tls_stash.len() == before {
+              return Poll::Ready(Ok(()));
+            }
+          }
+          Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+          Poll::Pending => return Poll::Pending,
+        }
       }
 
-      let payload_len = u16::from_be_bytes([header[3], header[4]]) as usize;
-      if payload_len > MAX_TLS_PAYLOAD + 2048 {
-        return Poll::Ready(Err(std::io::Error::new(
-          std::io::ErrorKind::InvalidData,
-          "TLS record too large",
-        )));
-      }
-
-      let mut payload = vec![0u8; payload_len];
-      let mut payload_buf = ReadBuf::new(&mut payload);
-      match Pin::new(&mut self.inner).poll_read(cx, &mut payload_buf) {
-        Poll::Ready(Ok(())) if payload_buf.filled().len() == payload_len => {}
-        Poll::Ready(Ok(())) => return Poll::Ready(Ok(())),
-        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-        Poll::Pending => return Poll::Pending,
-      }
-
-      if header[0] != TLS_APPLICATION_DATA {
+      if !self.read_buf.is_empty() {
         continue;
       }
 
-      self.read_buf = payload;
+      if self.tls_stash.len() < 5 {
+        match self.as_mut().poll_fill_tls_stash(cx) {
+          Poll::Ready(Ok(0)) => return Poll::Ready(Ok(())),
+          Poll::Ready(Ok(_)) => {}
+          Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+          Poll::Pending => return Poll::Pending,
+        }
+      }
+
+      if self.tls_stash.len() >= 5 && !looks_like_tls_record_header(&self.tls_stash) {
+        if let Some(pos) = self
+          .tls_stash
+          .windows(3)
+          .position(looks_like_tls_record_header)
+        {
+          self.tls_stash.drain(..pos);
+        }
+      }
     }
   }
 }

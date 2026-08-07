@@ -312,3 +312,91 @@ async fn split_ee_partial_client_hello_handshake() {
     Err(_) => panic!("relay_from_front timeout on partial ClientHello"),
   }
 }
+
+/// Клиент не досылает хвост ClientHello, сразу шлёт obfuscated2 как TLS App Data (0x17).
+#[tokio::test]
+async fn split_ee_partial_client_hello_obf2_without_tail() {
+  let dir = tempdir().expect("tempdir");
+  let users_file = dir.path().join("users.json").to_string_lossy().to_string();
+
+  let dc_addr = spawn_mock_dc().await;
+  let dc_backend = format!("{dc_addr}");
+
+  let back_listener = TcpListener::bind("127.0.0.1:0").await.expect("back bind");
+  let back_addr = back_listener.local_addr().expect("back addr");
+
+  let back_config_path = dir.path().join("back.toml");
+  let back_config = ee_test_config(&users_file, &dc_backend, &back_addr.to_string());
+  back_config
+    .save_to_file(&back_config_path)
+    .expect("save back");
+  let back_state = AppState::new(back_config, back_config_path.to_string_lossy()).expect("back state");
+  let back_split = back_state.config.read().expect("read").split.clone();
+
+  tokio::spawn(async move {
+    loop {
+      let (stream, peer) = back_listener.accept().await.expect("back accept");
+      let state = back_state.clone();
+      let split_cfg = back_split.clone();
+      tokio::spawn(async move {
+        let _ = handle_back_connection(stream, peer.ip(), &state, &split_cfg).await;
+      });
+    }
+  });
+  tokio::task::yield_now().await;
+
+  let front_config_path = dir.path().join("front.toml");
+  let front_config = front_test_config(&users_file, &back_addr.to_string());
+  front_config
+    .save_to_file(&front_config_path)
+    .expect("save front");
+  let front_state = AppState::new(front_config, front_config_path.to_string_lossy()).expect("front state");
+  let front_split = front_state.config.read().expect("read").split.clone();
+
+  let secret_bytes = decode_secret(EE_SECRET).expect("secret");
+  let full_client_hello =
+    stealth_gate::faketls::build_signed_client_hello_min_len(FAKE_DOMAIN, &secret_bytes, 1760);
+  let partial_client_hello = full_client_hello[..1334].to_vec();
+  let obf2 =
+    mtproto_obfuscate::generate_test_handshake(&secret_bytes, 2, [0xdd, 0xdd, 0xdd, 0xdd]);
+
+  let (mut tg_client, server_end) = tokio::io::duplex(65536);
+
+  let client_task = tokio::spawn(async move {
+    let mut server_hello_buf = vec![0u8; 8192];
+    let n = tg_client.read(&mut server_hello_buf).await.expect("read sh");
+    assert!(n > 100, "ожидался Fake TLS ServerHello");
+    tg_client
+      .write_all(&wrap_tls_app_data(&obf2))
+      .await
+      .expect("write obf2 without ch tail");
+  });
+
+  let relay_result = tokio::time::timeout(
+    std::time::Duration::from_secs(15),
+    relay_from_front(
+      server_end,
+      &partial_client_hello,
+      &dc_backend,
+      SecretMode::Ee,
+      None,
+      &front_split,
+      &front_state,
+    ),
+  )
+  .await;
+
+  client_task.await.expect("client join");
+
+  match relay_result {
+    Ok(Ok(())) => {}
+    Ok(Err(err)) => {
+      let msg = err.to_string();
+      assert!(
+        msg.contains("copy_bidirectional") || msg.contains("broken pipe"),
+        "unexpected relay error: {msg}"
+      );
+    }
+    Err(_) => panic!("relay_from_front timeout on obf2 without ch tail"),
+  }
+}
