@@ -32,6 +32,30 @@ pub fn tune_relay_stream(stream: &TcpStream) {
   let _ = stream.set_nodelay(true);
 }
 
+/// Ждёт первые байты на сыром TCP после split ACK (SGFB AEAD кадр от front).
+/// Возвращает прочитанный буфер — его нужно prepend перед EncryptedStream.
+pub async fn peek_raw_after_ack<S>(stream: &mut S, timeout: std::time::Duration) -> Result<Vec<u8>>
+where
+  S: tokio::io::AsyncRead + Unpin,
+{
+  use tokio::io::AsyncReadExt;
+
+  let mut buf = vec![0u8; 8192];
+  let n = tokio::time::timeout(timeout, stream.read(&mut buf))
+    .await
+    .map_err(|_| {
+      StealthGateError::Proxy("split back ee: timeout ожидания SGFB от front".into())
+    })?
+    .map_err(|err| StealthGateError::Proxy(format!("split back ee: peek raw SGFB: {err}")))?;
+  if n == 0 {
+    return Err(StealthGateError::Proxy(
+      "split back ee: front закрыл соединение до SGFB данных".into(),
+    ));
+  }
+  buf.truncate(n);
+  Ok(buf)
+}
+
 async fn socks5_connect(proxy_url: &str, target: &str, timeout_secs: u64) -> Result<TcpStream> {
   let (proxy_host, proxy_port, username, password) = parse_socks5_url(proxy_url)?;
   let (target_host, target_port) = parse_host_port(target)?;

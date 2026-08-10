@@ -634,28 +634,6 @@ fn peer_allowed(peer_ip: IpAddr, allowlist: &[String]) -> bool {
   })
 }
 
-/// Ждёт первый obf2-чанк от front (расшифрованный MTProto plaintext).
-/// Блокирует до данных — front шлёт primed SGFB сразу после ACK.
-async fn read_first_obf2_from_front<S>(stream: &mut S, timeout: Duration) -> Result<Vec<u8>>
-where
-  S: AsyncRead + Unpin,
-{
-  let mut buf = vec![0u8; 8192];
-  let n = tokio::time::timeout(timeout, stream.read(&mut buf))
-    .await
-    .map_err(|_| {
-      StealthGateError::Proxy("split back ee: timeout ожидания obf2 от front".into())
-    })?
-    .map_err(|err| StealthGateError::Proxy(format!("split back ee: read obf2 от front: {err}")))?;
-  if n == 0 {
-    return Err(StealthGateError::Proxy(
-      "split back ee: front закрыл соединение до obf2 данных".into(),
-    ));
-  }
-  buf.truncate(n);
-  Ok(buf)
-}
-
 async fn handle_back_ee_connection<S>(
   mut front_stream: S,
   peer_ip: IpAddr,
@@ -670,7 +648,7 @@ where
 {
   let secret = proxy::resolve_secret_bytes(state, None)?;
 
-  let (relay_dc_id, proto_tag) = if frame.initial_data.len() == mtproto_obfuscate::HANDSHAKE_LEN {
+  let (frame_dc_id, _frame_proto_tag) = if frame.initial_data.len() == mtproto_obfuscate::HANDSHAKE_LEN {
     let handshake: [u8; mtproto_obfuscate::HANDSHAKE_LEN] = frame
       .initial_data
       .as_slice()
@@ -708,7 +686,23 @@ where
   // ACK сразу — front может начать SGFB relay, пока back подключается к DC.
   send_ack(&mut front_stream, true, None).await?;
 
-  let front_io = wrap_relay_stream(front_stream, session_keys, relay_encrypted, false);
+  let timeout = Duration::from_secs(split.connect_timeout_secs);
+
+  // Ждём primed SGFB на сыром TCP до relay_init — иначе DC закрывает сессию (c2b=0 b2c=0).
+  // Байты prepend до EncryptedStream, obf2 relay идёт как в monolith (без decrypt/reinject).
+  let sgfb_peek = network::peek_raw_after_ack(&mut front_stream, timeout).await?;
+  tracing::debug!(
+    sgfb_peek_bytes = sgfb_peek.len(),
+    encrypted = relay_encrypted,
+    "split back ee: SGFB данные от front получены, старт relay к DC"
+  );
+
+  let front_io = wrap_relay_stream(
+    PrefixedStream::new(sgfb_peek, front_stream),
+    session_keys,
+    relay_encrypted,
+    false,
+  );
   let prefixed = PrefixedStream::new(frame.initial_data, front_io);
 
   let network = {
@@ -726,7 +720,6 @@ where
     .clone();
 
   let backend = frame.backend.clone();
-  let timeout = Duration::from_secs(split.connect_timeout_secs);
 
   let (accepted, (mut upstream, connected_backend)) = tokio::try_join!(
     mtproto_obfuscate::accept_handshake(prefixed, &secret),
@@ -745,10 +738,12 @@ where
     );
   }
 
-  // Сначала obf2 от front (RU шлёт primed SGFB сразу после ACK), затем relay_init.
-  // Иначе DC получает relay_init без client data и закрывает соединение (c2b=0 b2c=0).
-  let mut client_stream = accepted.stream;
-  let first_obf2 = read_first_obf2_from_front(&mut client_stream, timeout).await?;
+  let relay_dc_id = if accepted.dc_id != 0 {
+    accepted.dc_id
+  } else {
+    frame_dc_id
+  };
+  let proto_tag = accepted.proto_tag;
 
   let (header, relay_keys) = mtproto_obfuscate::generate_relay_init(relay_dc_id, proto_tag)?;
   upstream
@@ -765,16 +760,14 @@ where
     relay_dc_id,
     proto_tag = %hex::encode(proto_tag),
     backend = %connected_backend,
-    first_obf2_bytes = first_obf2.len(),
     encrypted = relay_encrypted,
-    "split back ee: obf2 от front, relay init в DC, старт copy"
+    "split back ee: relay init в DC, старт monolith copy"
   );
 
   state.stats.split_relayed.fetch_add(1, Ordering::Relaxed);
 
-  let client_io = PrefixedStream::new(first_obf2, client_stream);
   let dc_stream = ObfuscatedStream::from_relay_keys(upstream, relay_keys);
-  let (c2b, b2c) = proxy::copy_bidirectional_graceful(client_io, dc_stream).await?;
+  let (c2b, b2c) = proxy::copy_bidirectional_graceful(accepted.stream, dc_stream).await?;
   if c2b == 0 && b2c == 0 {
     tracing::warn!(
       %peer_ip,
