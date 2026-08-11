@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
 # Установка StealthGate как systemd-сервиса.
+#
+# Роли split-деплоя:
+#   INSTALL_ROLE=front  — публичный edge (RU), configs/config.front.toml
+#   INSTALL_ROLE=back   — relay к Telegram DC (EU), configs/config.back.toml
+#   INSTALL_ROLE=monolith (по умолчанию) — configs/config.toml
+#
+# Примеры:
+#   sudo INSTALL_ROLE=front bash deploy/install.sh
+#   sudo INSTALL_ROLE=back bash deploy/install.sh
+#   sudo bash deploy/install.sh --front
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -7,6 +17,7 @@ INSTALL_PREFIX="${INSTALL_PREFIX:-/opt/stealth-gate}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/stealth-gate}"
 SERVICE_NAME="${SERVICE_NAME:-stealth-gate}"
 SERVICE_USER="${SERVICE_USER:-stealthgate}"
+INSTALL_ROLE="${INSTALL_ROLE:-monolith}"
 BINARY_SRC="${BINARY_SRC:-$ROOT/target/release/stealth-gate}"
 UNINSTALL_SCRIPT="${INSTALL_PREFIX}/bin/uninstall"
 
@@ -19,11 +30,82 @@ die() {
   exit 1
 }
 
+usage() {
+  cat <<EOF
+Установка StealthGate как systemd-сервиса.
+
+Использование:
+  sudo bash deploy/install.sh [--monolith|--front|--back]
+
+Переменные окружения:
+  INSTALL_ROLE   monolith | front | back (по умолчанию monolith)
+  INSTALL_PREFIX /opt/stealth-gate
+  CONFIG_DIR     /etc/stealth-gate
+  SERVICE_NAME   stealth-gate
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --monolith)
+      INSTALL_ROLE=monolith
+      ;;
+    --front)
+      INSTALL_ROLE=front
+      ;;
+    --back)
+      INSTALL_ROLE=back
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "неизвестный аргумент: $1 (см. --help)"
+      ;;
+  esac
+  shift
+done
+
+case "${INSTALL_ROLE}" in
+  monolith|front|back) ;;
+  *)
+    die "некорректный INSTALL_ROLE=${INSTALL_ROLE} (ожидается monolith, front или back)"
+    ;;
+esac
+
+config_template_for_role() {
+  case "${INSTALL_ROLE}" in
+    front) printf '%s/configs/config.front.toml' "${ROOT}" ;;
+    back) printf '%s/configs/config.back.toml' "${ROOT}" ;;
+    *) printf '%s/configs/config.toml' "${ROOT}" ;;
+  esac
+}
+
+users_file_for_role() {
+  case "${INSTALL_ROLE}" in
+    back) printf '%s/data/users-back.json' "${INSTALL_PREFIX}" ;;
+    *) printf '%s/data/users.json' "${INSTALL_PREFIX}" ;;
+  esac
+}
+
+admin_socket_for_role() {
+  case "${INSTALL_ROLE}" in
+    back) printf '/tmp/stealth-gate-back.sock' ;;
+    *) printf '/tmp/stealth-gate.sock' ;;
+  esac
+}
+
 if [[ "${EUID}" -ne 0 ]]; then
   die "запусти от root: sudo bash deploy/install.sh"
 fi
 
 [[ -x "${BINARY_SRC}" ]] || die "сначала собери бинарник: cargo build --release"
+
+CONFIG_TEMPLATE="$(config_template_for_role)"
+[[ -f "${CONFIG_TEMPLATE}" ]] || die "шаблон конфигурации не найден: ${CONFIG_TEMPLATE}"
+
+log "роль установки: ${INSTALL_ROLE} (шаблон ${CONFIG_TEMPLATE#${ROOT}/})"
 
 if ! id "${SERVICE_USER}" &>/dev/null; then
   log "создаю пользователя ${SERVICE_USER}"
@@ -73,8 +155,11 @@ fi
 
 if [[ ! -f "${CONFIG_DIR}/config.toml" ]]; then
   log "копирую шаблон config.toml"
-  install -m 640 "${ROOT}/configs/config.toml" "${CONFIG_DIR}/config.toml"
+  install -m 640 "${CONFIG_TEMPLATE}" "${CONFIG_DIR}/config.toml"
   chown root:"${SERVICE_USER}" "${CONFIG_DIR}/config.toml"
+else
+  log "config.toml уже существует — не перезаписываю (роль: ${INSTALL_ROLE})"
+  log "для смены роли удали ${CONFIG_DIR}/config.toml или скопируй шаблон вручную"
 fi
 
 patch_config_path() {
@@ -90,7 +175,8 @@ log "обновляю пути в config.toml для production"
 patch_config_path cert_file "${INSTALL_PREFIX}/certs/cert.pem"
 patch_config_path key_file "${INSTALL_PREFIX}/certs/key.pem"
 patch_config_path static_html "${INSTALL_PREFIX}/web/index.html"
-patch_config_path users_file "${INSTALL_PREFIX}/data/users.json"
+patch_config_path users_file "$(users_file_for_role)"
+patch_config_path socket "$(admin_socket_for_role)"
 
 if grep -q '^uninstall_enabled' "${CONFIG_DIR}/config.toml"; then
   sed -i 's/^uninstall_enabled = .*/uninstall_enabled = true/' "${CONFIG_DIR}/config.toml"
@@ -124,7 +210,19 @@ else
   journalctl -u "${SERVICE_NAME}" -n 8 --no-pager 2>/dev/null || true
 fi
 
-log "готово"
+log "готово (роль: ${INSTALL_ROLE})"
 log "  статус: systemctl status ${SERVICE_NAME}"
-log "  WebUI:  http://127.0.0.1:8088/ui/login.html"
+case "${INSTALL_ROLE}" in
+  front)
+    log "  WebUI:  http://127.0.0.1:8088/ui/login.html"
+    log "  проверь split.back_servers и auth_token в ${CONFIG_DIR}/config.toml"
+    ;;
+  back)
+    log "  WebUI:  http://127.0.0.1:8089/ui/login.html"
+    log "  проверь split.front_allowlist и auth_token в ${CONFIG_DIR}/config.toml"
+    ;;
+  *)
+    log "  WebUI:  http://127.0.0.1:8088/ui/login.html"
+    ;;
+esac
 log "  удаление: sudo ${UNINSTALL_SCRIPT} [--purge]"

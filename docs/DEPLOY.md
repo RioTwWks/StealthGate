@@ -1,11 +1,39 @@
 # Деплой StealthGate (systemd)
 
-## Быстрая установка
+## Быстрая установка (monolith)
 
 ```bash
 cargo build --release
 sudo bash deploy/install.sh
 ```
+
+## Front/Back split в production
+
+Для split-деплоя на **двух** серверах используй разные роли — не один `config.toml`:
+
+| Сервер | Роль | Команда | Шаблон |
+|--------|------|---------|--------|
+| RU (публичный edge) | front | `sudo bash deploy/install.sh --front` | `configs/config.front.toml` |
+| EU (relay к Telegram DC) | back | `sudo bash deploy/install.sh --back` | `configs/config.back.toml` |
+
+Или через переменную окружения:
+
+```bash
+# RU
+sudo INSTALL_ROLE=front bash deploy/install.sh
+
+# EU
+sudo INSTALL_ROLE=back bash deploy/install.sh
+```
+
+После установки **обязательно** согласуй в обоих `config.toml`:
+- одинаковый `split.auth_token` (минимум 16 символов)
+- на front: `split.back_servers` = IP EU:8444
+- на back: `split.front_allowlist` = IP RU
+
+Back слушает SGFB на `back_listen_port` (по умолчанию 8444). Порт не должен быть доступен из интернета. Подробнее: [SPLIT.md](./SPLIT.md).
+
+> Если `config.toml` уже создан при monolith-установке, install не перезапишет его — удали `/etc/stealth-gate/config.toml` и переустанови с нужной ролью, либо скопируй шаблон вручную.
 
 Или через `just`:
 
@@ -35,17 +63,7 @@ sudo journalctl -u stealth-gate -e --no-pager
 Типичные причины:
 - **Permission denied на bind :443** — unit должен содержать `AmbientCapabilities=CAP_NET_BIND_SERVICE` (без `NoNewPrivileges=true`, иначе `setcap` не работает под systemd)
 - **ошибка конфигурации** — проверь `/etc/stealth-gate/config.toml`
-
-## Front/Back split в production
-
-Для split-деploy запусти **два** экземпляра с разными конфигами:
-
-| Узел | Конфиг | Роль |
-|------|--------|------|
-| Публичный VPS | `configs/config.front.toml` | `[split].mode = "front"` |
-| Internal relay | `configs/config.back.toml` | `[split].mode = "back"` |
-
-Back слушает SGFB на internal interface (`back_listen_port`, по умолчанию 8444). Front подключается к `back_servers`. Подробнее: [SPLIT.md](./SPLIT.md).
+- **split: front/back перепутаны** — на RU нужен `--front`, на EU `--back` (см. выше)
 
 ## Удаление одной командой
 

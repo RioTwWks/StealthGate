@@ -42,7 +42,13 @@ clean:
 
 # Установка systemd-сервиса (требует root)
 install-service: build
-    sudo bash deploy/install.sh
+	sudo bash deploy/install.sh
+
+install-service-front: build
+	sudo bash deploy/install.sh --front
+
+install-service-back: build
+	sudo bash deploy/install.sh --back
 
 # Удаление systemd-сервиса одной командой (требует root)
 uninstall-service:
