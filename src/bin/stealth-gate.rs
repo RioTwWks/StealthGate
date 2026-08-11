@@ -15,7 +15,15 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+  if let Err(err) = run().await {
+    tracing::error!(error = %err, "StealthGate завершился с ошибкой");
+    eprintln!("{err}");
+    std::process::exit(1);
+  }
+}
+
+async fn run() -> Result<()> {
   tracing_subscriber::fmt()
     .with_env_filter(
       EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
