@@ -15,12 +15,13 @@ Environment=RUST_LOG=info
 # Пароль первого admin WebUI (опционально)
 # Environment=STEALTHGATE_ADMIN_PASSWORD=...
 
-# Hardening
-NoNewPrivileges=true
+# Hardening (NoNewPrivileges отключён: иначе setcap и AmbientCapabilities не дают bind на :443)
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/opt/stealth-gate/data /tmp
 PrivateTmp=true
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target

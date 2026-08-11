@@ -33,7 +33,7 @@ sudo journalctl -u stealth-gate -e --no-pager
 ```
 
 Типичные причины:
-- **Permission denied на bind :443** — перезапусти `sudo bash deploy/install.sh` (нужен `setcap`) или установи `libcap2-bin`
+- **Permission denied на bind :443** — unit должен содержать `AmbientCapabilities=CAP_NET_BIND_SERVICE` (без `NoNewPrivileges=true`, иначе `setcap` не работает под systemd)
 - **ошибка конфигурации** — проверь `/etc/stealth-gate/config.toml`
 
 ## Front/Back split в production

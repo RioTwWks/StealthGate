@@ -39,10 +39,11 @@ install -m 755 "${BINARY_SRC}" "${INSTALL_PREFIX}/bin/stealth-gate"
 install -m 755 "${ROOT}/deploy/uninstall.sh" "${UNINSTALL_SCRIPT}"
 
 if command -v setcap &>/dev/null; then
-  log "выдаю cap_net_bind_service (слушать :443 под пользователем ${SERVICE_USER})"
-  setcap 'cap_net_bind_service=+ep' "${INSTALL_PREFIX}/bin/stealth-gate"
+  log "выдаю cap_net_bind_service (для ручного запуска вне systemd)"
+  setcap 'cap_net_bind_service=+ep' "${INSTALL_PREFIX}/bin/stealth-gate" || \
+    log "предупреждение: setcap не применился (nosuid на разделе?) — systemd unit использует AmbientCapabilities"
 else
-  log "предупреждение: setcap не найден (пакет libcap2-bin) — bind на порт 443 может не работать"
+  log "предупреждение: setcap не найден (пакет libcap2-bin) — bind на :443 через AmbientCapabilities в unit"
 fi
 
 log "копирую статику WebUI и fallback HTML"
@@ -114,6 +115,14 @@ chmod 440 "/etc/sudoers.d/${SERVICE_NAME}-uninstall"
 
 systemctl daemon-reload
 systemctl enable --now "${SERVICE_NAME}"
+
+sleep 1
+if systemctl is-active --quiet "${SERVICE_NAME}"; then
+  log "сервис ${SERVICE_NAME} запущен"
+else
+  log "предупреждение: сервис не запустился — смотри: journalctl -u ${SERVICE_NAME} -e --no-pager"
+  journalctl -u "${SERVICE_NAME}" -n 8 --no-pager 2>/dev/null || true
+fi
 
 log "готово"
 log "  статус: systemctl status ${SERVICE_NAME}"
