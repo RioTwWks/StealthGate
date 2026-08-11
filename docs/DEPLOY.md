@@ -16,9 +16,25 @@ just install-service
 Скрипт:
 - создаёт пользователя `stealthgate`
 - копирует бинарник в `/opt/stealth-gate/bin/`
+- выдаёт `cap_net_bind_service` бинарнику (слушать порт 443 без root)
+- копирует `web/` и TLS-сертификаты в `/opt/stealth-gate/`
 - устанавливает unit `deploy/stealth-gate.service`
 - включает `admin.uninstall_enabled` в `/etc/stealth-gate/config.toml`
 - настраивает sudo для удаления из WebUI
+
+Зависимости на хосте: `openssl`, `libcap2-bin` (для `setcap`).
+
+## Диагностика
+
+Если сервис падает с `status=1/FAILURE`:
+
+```bash
+sudo journalctl -u stealth-gate -e --no-pager
+```
+
+Типичные причины:
+- **Permission denied на bind :443** — перезапусти `sudo bash deploy/install.sh` (нужен `setcap`) или установи `libcap2-bin`
+- **ошибка конфигурации** — проверь `/etc/stealth-gate/config.toml`
 
 ## Front/Back split в production
 
